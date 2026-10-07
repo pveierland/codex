@@ -2989,6 +2989,35 @@ impl AuthManager {
         }
     }
 
+    /// Adopts credentials another process stored, such as an account switcher replacing
+    /// `auth.json`. Subscribers observe the change through [`Self::auth_change_state_receiver`].
+    ///
+    /// Keeps the cached auth while the store holds no usable credentials: a writer may briefly
+    /// leave it missing or partially written, and its final write is adopted on the next call.
+    /// Serializes with token refresh so a refresh of the previous account cannot overwrite it.
+    pub async fn reload_stored_auth(&self) {
+        let Ok(_refresh_guard) = self.refresh_lock.acquire().await else {
+            return;
+        };
+        loop {
+            let generation = self.auth_change_state_tx.borrow().generation;
+            if self.has_external_auth() {
+                return;
+            }
+            let cached = self.auth_cached();
+            let Ok(Some(new_auth)) = self.try_load_managed_auth(cached.as_ref()).await else {
+                return;
+            };
+            if self
+                .publish_reloaded_auth(generation, Some(new_auth))
+                .is_some()
+                || self.inner.is_poisoned()
+            {
+                return;
+            }
+        }
+    }
+
     async fn reload_if_account_id_matches(
         &self,
         expected_account_id: Option<&str>,

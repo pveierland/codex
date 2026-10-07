@@ -28,6 +28,7 @@ mod gateway_oauth;
 mod gcp_setup;
 mod rate_limit_resets;
 mod security_setup;
+mod stored_auth_watch;
 mod workspace_routing;
 mod workspace_switching;
 
@@ -124,6 +125,7 @@ pub(crate) struct AccountRequestProcessor {
     gateway_clients:
         Arc<std::sync::Mutex<HashMap<String, Arc<codex_model_provider::GatewayAuthManager>>>>,
     _gateway_notifications: Arc<tokio_util::task::AbortOnDropHandle<()>>,
+    _stored_auth_watch: Option<Arc<tokio_util::task::AbortOnDropHandle<()>>>,
     pub(super) enterprise_login: Arc<enterprise_login::EnterpriseLoginState>,
 }
 
@@ -146,8 +148,13 @@ impl AccountRequestProcessor {
             Arc::clone(&thread_manager),
             config_manager.clone(),
         ));
-        let processor = Arc::new(Self {
+        let processor = Arc::new_cyclic(|processor| Self {
             _gateway_notifications: Arc::new(gateway_notifications),
+            _stored_auth_watch: stored_auth_watch::spawn(
+                processor.clone(),
+                config.codex_home.as_path(),
+            )
+            .map(Arc::new),
             auth_manager,
             thread_manager,
             outgoing,
@@ -1029,6 +1036,57 @@ impl AccountRequestProcessor {
                 )
                 .await;
         }
+    }
+
+    /// Adopt credentials another process stored, such as an account switcher replacing
+    /// `auth.json`, and announce a different account the way a sign-in here does.
+    async fn adopt_stored_auth(&self) {
+        // Hosts that supply credentials own account selection.
+        if self.auth_manager.has_external_auth()
+            || self.auth_manager.is_workload_identity_selected()
+        {
+            return;
+        }
+        let auth_changes = self.auth_manager.auth_change_state_receiver();
+        let previous_owner_generation = auth_changes.borrow().owner_generation;
+        self.auth_manager.reload_stored_auth().await;
+        let owner_generation = auth_changes.borrow().owner_generation;
+        if owner_generation == previous_owner_generation {
+            // The same account, or the same account with tokens another process refreshed.
+            return;
+        }
+        tracing::info!("adopted an account stored by another process");
+        self.thread_manager
+            .invalidate_mcp_runtimes_for(McpRefreshReason::AccountAuthReloaded)
+            .await;
+        self.config_manager
+            .update_managed_config_loader(self.auth_manager.clone(), &self.config)
+            .await;
+        self.config_manager
+            .sync_default_client_residency_requirement()
+            .await;
+        self.model_catalog.invalidate().await;
+        let account_read = self.read_account(/*request*/ None).await.is_ok();
+        if account_read && auth_changes.borrow().owner_generation == owner_generation {
+            refresh_guardian_policy(&self.thread_manager).await;
+        }
+        if account_read && auth_changes.borrow().owner_generation == owner_generation {
+            Self::maybe_refresh_plugin_caches_for_current_config(
+                &self.config_manager,
+                &self.thread_manager,
+                self.auth_manager.auth_cached(),
+            )
+            .await;
+        }
+        let notification = self.current_account_updated_notification();
+        self.outgoing
+            .send_account_notification(
+                /*connection_id*/ None,
+                &auth_changes,
+                owner_generation,
+                AccountNotification::Updated(notification),
+            )
+            .await;
     }
 
     async fn send_chatgpt_login_completion_notifications(
