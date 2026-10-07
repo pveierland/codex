@@ -24,6 +24,10 @@
       cargoToml = builtins.fromTOML (builtins.readFile ./codex-rs/Cargo.toml);
       cargoVersion = cargoToml.workspace.package.version;
 
+      # Build with the toolchain the workspace pins for development and CI.
+      rustChannel =
+        (builtins.fromTOML (builtins.readFile ./codex-rs/rust-toolchain.toml)).toolchain.channel;
+
       # When building from a release commit the Cargo.toml already carries the
       # real version (e.g. "0.101.0").  On the main branch it is the placeholder
       # "0.0.0", so we fall back to a dev version derived from the flake source.
@@ -42,8 +46,8 @@
           codex-rs = pkgs.callPackage ./codex-rs {
             inherit version;
             rustPlatform = pkgs.makeRustPlatform {
-              cargo = pkgs.rust-bin.stable.latest.minimal;
-              rustc = pkgs.rust-bin.stable.latest.minimal;
+              cargo = pkgs.rust-bin.stable.${rustChannel}.minimal;
+              rustc = pkgs.rust-bin.stable.${rustChannel}.minimal;
             };
           };
         in
@@ -59,7 +63,7 @@
             inherit system;
             overlays = [ rust-overlay.overlays.default ];
           };
-          rust = pkgs.rust-bin.stable.latest.default.override {
+          rust = pkgs.rust-bin.stable.${rustChannel}.default.override {
             extensions = [ "rust-src" "rust-analyzer" ];
           };
         in
@@ -72,7 +76,7 @@
               pkgs.cmake
               pkgs.llvmPackages.clang
               pkgs.llvmPackages.libclang.lib
-            ];
+            ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.libcap ];
             PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             # Use clang for BoringSSL compilation (avoids GCC 15 warnings-as-errors)
