@@ -1561,6 +1561,13 @@ impl Tui {
                 self.suspend_context.set_cursor_y(inline_area_bottom);
             }
 
+            // Owned screens repaint every cell from the buffers, so scrolled transcript rows can
+            // be moved by the terminal unless an image occupies cells the buffers do not model.
+            terminal.set_hardscroll(
+                self.owned_screen
+                    && !self.ambient_pet_image_state.is_displayed()
+                    && !self.pet_picker_preview_image_state.is_displayed(),
+            );
             terminal.draw_with_size(screen_size, &mut self.retained_images, |frame| {
                 draw_fn(frame);
                 self.shortcut_hud_area = self.shortcut_hud.as_ref().map(|hud| hud.paint(frame));
@@ -1706,6 +1713,13 @@ impl Tui {
                 self.suspend_context.set_cursor_y(inline_area_bottom);
             }
 
+            // Owned screens repaint every cell from the buffers, so scrolled transcript rows can
+            // be moved by the terminal unless an image occupies cells the buffers do not model.
+            terminal.set_hardscroll(
+                self.owned_screen
+                    && !self.ambient_pet_image_state.is_displayed()
+                    && !self.pet_picker_preview_image_state.is_displayed(),
+            );
             terminal.draw_with_size(screen_size, &mut self.retained_images, |frame| {
                 draw_fn(frame);
                 self.shortcut_hud_area = hud.as_ref().map(|hud| hud.paint(frame));

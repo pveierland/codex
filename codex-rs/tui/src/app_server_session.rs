@@ -413,6 +413,8 @@ pub(crate) struct AppServerSession {
     pub(crate) attempted_revision: Option<String>,
     pub(crate) frozen_receipt: Option<(ThreadId, String)>,
     pub(crate) unread_revisions: HashMap<ThreadId, String>,
+    /// When each paged history item happened, in Unix milliseconds, by thread and item id.
+    history_item_times: HashMap<ThreadId, HashMap<(String, String), i64>>,
     task_tool_threads: HashSet<ThreadId>,
     task_tool_capabilities_dir: Option<AbsolutePathBuf>,
     pub(crate) task_search: crate::task_mentions::TaskSearch,
@@ -677,6 +679,7 @@ impl AppServerSession {
             attempted_revision: None,
             frozen_receipt: None,
             unread_revisions: HashMap::new(),
+            history_item_times: HashMap::new(),
             task_tool_threads: HashSet::new(),
             task_tool_capabilities_dir: None,
             task_search: crate::task_mentions::TaskSearch::default(),

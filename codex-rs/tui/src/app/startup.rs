@@ -1067,6 +1067,7 @@ See the Codex keymap documentation for supported actions and examples."
             key_chord_matcher: KeyChordMatcher::default(),
             routed_key_activation: None,
             transcript_cells: Vec::new(),
+            history_times: Default::default(),
             native_history: Default::default(),
             turn_tips: Default::default(),
             transcript_view: Default::default(),

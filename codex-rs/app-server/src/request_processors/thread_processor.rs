@@ -6693,6 +6693,7 @@ fn stored_thread_item_to_entry(
         output_deferred: false,
         started_at_ms: item.started_at_ms,
         completed_at_ms: item.completed_at_ms,
+        created_at_ms: Some(stored_item.created_at_ms),
         item,
     })
 }

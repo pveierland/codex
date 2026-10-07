@@ -52,6 +52,7 @@ use ratatui::style::Modifier;
 use ratatui::widgets::WidgetRef;
 
 mod cursor;
+mod hardscroll;
 
 #[cfg(test)]
 #[path = "custom_terminal_test_support.rs"]
@@ -160,6 +161,8 @@ where
     pub last_known_cursor_pos: Position,
     /// Count of visible history rows rendered above the viewport in inline mode.
     visible_history_rows: u16,
+    /// Whether frames may scroll terminal rows instead of repainting shifted content.
+    hardscroll: bool,
     #[cfg(test)]
     screen_size_override: Option<Size>,
 }
@@ -241,6 +244,7 @@ where
             last_known_screen_size: screen_size,
             last_known_cursor_pos: cursor_pos,
             visible_history_rows: 0,
+            hardscroll: false,
             #[cfg(test)]
             screen_size_override: None,
         }
@@ -455,6 +459,19 @@ where
             }
         }
 
+        // Not every terminal or multiplexer hides intermediate cursor moves inside a
+        // synchronized update, especially when the frame spans multiple writes.
+        // Scrolled rows would carry out-of-band images along, so frames with images repaint.
+        if self.hardscroll
+            && images.is_empty()
+            && let Some(plan) = hardscroll::plan(self.previous_buffer(), self.current_buffer())
+        {
+            if !self.hidden_cursor {
+                self.hide_cursor()?;
+            }
+            hardscroll::write(&mut self.backend, plan, self.viewport_area.y)?;
+            hardscroll::apply(self.previous_buffer_mut(), plan);
+        }
         // A text clear, focus highlight, or full repaint can erase an otherwise stable image.
         let updates = diff_buffers(self.previous_buffer(), self.current_buffer());
         let mut redraw = Vec::new();
@@ -537,6 +554,14 @@ where
         Backend::flush(&mut self.backend)?;
 
         Ok(())
+    }
+
+    /// Allow frames to scroll terminal rows when content shifts vertically.
+    ///
+    /// Enable only while the buffers model every cell of the viewport: out-of-band output such
+    /// as images would move with the scrolled rows.
+    pub(crate) fn set_hardscroll(&mut self, enabled: bool) {
+        self.hardscroll = enabled;
     }
 
     /// Hides the cursor.

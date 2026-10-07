@@ -545,6 +545,7 @@ fn sidebar_files_respect_page_boundaries_for_typed_voice_and_review_items() {
         output_deferred: false,
         started_at_ms: None,
         completed_at_ms: None,
+        created_at_ms: None,
     };
     let user = |id: &str, text: &str| {
         entry(ThreadItemPayload::UserMessage {

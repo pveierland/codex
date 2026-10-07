@@ -1,5 +1,6 @@
 //! Load bounded history pages into the transcript before updating its owned or inline viewport.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ops::Range;
 
@@ -12,11 +13,20 @@ use crate::pager_overlay::TranscriptHistoryState;
 use crate::thread_transcript::RawReasoningVisibility;
 use crate::thread_transcript::TranscriptCells;
 use crate::thread_transcript::thread_items_to_transcript_cells;
+use crate::thread_transcript::thread_items_to_transcript_cells_with_sources;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::ThreadItemsListResponse;
 
 #[path = "history_completion.rs"]
 mod completion;
+
+/// The thread, working directory, and reasoning visibility an older page's items render with.
+#[derive(Clone, Copy)]
+struct PageProjection<'a> {
+    thread_id: ThreadId,
+    cwd: &'a std::path::Path,
+    visibility: RawReasoningVisibility,
+}
 
 impl App {
     /// Start one bounded page request shared by scrollback refill and the transcript overlay.
@@ -88,32 +98,50 @@ impl App {
             app_server.cancel_older_history_page(thread_id, cursor);
             return Ok(());
         };
-        let (cwd, mut turns) = {
+        // Fetch without holding the store, then apply the page to the stored turns in place.
+        // Copying every loaded turn per page made each page slower than the last.
+        let known_turn_ids = {
             let store = store.lock().await;
-            (
-                store
-                    .session
-                    .as_ref()
-                    .map(|session| session.cwd.to_path_buf())
-                    .unwrap_or_else(|| self.config.cwd.to_path_buf()),
-                store.turns.clone(),
-            )
+            store.turns.iter().map(|turn| turn.id.clone()).collect()
         };
-        let items = app_server
-            .apply_older_history_page(thread_id, cursor, page, &mut turns)
+        let page = app_server
+            .fetch_older_history_page(thread_id, cursor, page, known_turn_ids)
             .await?;
-        let hidden_item_ids = hidden_review_item_ids(&turns);
-        let visibility = if self.config.show_raw_agent_reasoning {
-            RawReasoningVisibility::Visible
-        } else {
-            RawReasoningVisibility::Hidden
+        let mut store = store.lock().await;
+        let cwd = store
+            .session
+            .as_ref()
+            .map(|session| session.cwd.to_path_buf())
+            .unwrap_or_else(|| self.config.cwd.to_path_buf());
+        let items = page.apply(&mut store.turns)?;
+        let turns = &store.turns;
+        let page_turns = leading_page_turns(turns, &items);
+        let hidden_item_ids = hidden_review_item_ids_through(turns, page_turns);
+        let projection = PageProjection {
+            thread_id,
+            cwd: &cwd,
+            visibility: if self.config.show_raw_agent_reasoning {
+                RawReasoningVisibility::Visible
+            } else {
+                RawReasoningVisibility::Hidden
+            },
         };
         let width = tui.terminal.last_known_screen_size.width;
-        self.remove_hidden_review_cells(tui, &turns, &hidden_item_ids, thread_id, &cwd, visibility);
+        // Only prompts that were already rendered can need removal.
+        let page_item_ids = items
+            .iter()
+            .map(|(turn_id, item)| (turn_id.as_str(), item.id()))
+            .collect::<HashSet<_>>();
+        let revealed_item_ids = hidden_item_ids
+            .iter()
+            .copied()
+            .filter(|id| !page_item_ids.contains(id))
+            .collect::<HashSet<_>>();
+        self.remove_hidden_review_cells(tui, turns, &revealed_item_ids, projection);
         let split_turn = items
             .last()
             .and_then(|(turn_id, last)| {
-                turns.iter().find(|turn| {
+                turns[..page_turns].iter().find(|turn| {
                     turn.id == *turn_id
                         && matches!(turn.status, TurnStatus::Completed | TurnStatus::Interrupted)
                         && turn.items.last().is_some_and(|item| item.id() != last.id())
@@ -130,12 +158,11 @@ impl App {
         let split_insertion = split_image_insertion(existing, split_turn);
         let (cells, split_images) = self.project_older_history_cells(
             items,
-            &turns,
+            &turns[..page_turns],
             &hidden_item_ids,
-            thread_id,
-            &cwd,
-            visibility,
+            projection,
             split_insertion.is_some(),
+            |turn_id, item_id| app_server.history_item_time(thread_id, turn_id, item_id),
         );
         if let Some(pane) = self.side_companions.get_mut(&thread_id).filter(|_| parked) {
             let images = split_insertion.and_then(|index| {
@@ -155,7 +182,7 @@ impl App {
             } else {
                 TranscriptHistoryState::Complete
             };
-            merge_older_turns(&mut store.lock().await.turns, turns);
+            drop(store);
             tui.frame_requester().schedule_frame();
             return Ok(());
         }
@@ -174,9 +201,9 @@ impl App {
         self.transcript_view
             .history_page_loaded(&self.transcript_cells, inserted.clone(), images);
         if !inserted.is_empty() {
-            self.join_older_activity_group(inserted.end, &turns);
+            self.join_older_activity_group(inserted.end, turns);
         }
-        merge_older_turns(&mut store.lock().await.turns, turns);
+        drop(store);
         self.scrollback_has_older_history = app_server.has_older_history(thread_id);
         if self.backtrack.overlay_preview_active
             && self.backtrack.nth_user_message == usize::MAX
@@ -203,13 +230,12 @@ impl App {
         tui: &mut tui::Tui,
         turns: &[Turn],
         hidden_item_ids: &HashSet<(&str, &str)>,
-        thread_id: ThreadId,
-        cwd: &std::path::Path,
-        visibility: RawReasoningVisibility,
+        projection: PageProjection<'_>,
     ) {
         if hidden_item_ids.is_empty() {
             return;
         }
+        let thread_id = projection.thread_id;
         let user_items = turns
             .iter()
             .flat_map(|turn| {
@@ -220,10 +246,10 @@ impl App {
             .map(|(turn_id, item)| (hidden_item_ids.contains(&(turn_id, item.id())), item))
             .collect::<Vec<_>>();
         let projected_user_cells = thread_items_to_transcript_cells(
-            Some(thread_id),
-            cwd,
+            Some(projection.thread_id),
+            projection.cwd,
             user_items.iter().map(|(_, item)| (*item).clone()),
-            visibility,
+            projection.visibility,
             Some(&self.config),
         );
         let persisted_user_cells = user_items
@@ -280,20 +306,20 @@ impl App {
     }
 
     /// Project each terminal row on the page containing the end of its turn.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Projection needs the thread context and whether its split turn has a rendered end."
-    )]
     fn project_older_history_cells(
         &mut self,
         items: Vec<(String, ThreadItemPayload)>,
         turns: &[Turn],
         hidden_item_ids: &HashSet<(&str, &str)>,
-        thread_id: ThreadId,
-        cwd: &std::path::Path,
-        visibility: RawReasoningVisibility,
+        projection: PageProjection<'_>,
         relocate_split_images: bool,
+        item_time_ms: impl Fn(&str, &str) -> Option<i64>,
     ) -> (TranscriptCells, TranscriptCells) {
+        let PageProjection {
+            thread_id,
+            cwd,
+            visibility,
+        } = projection;
         let cloud = matches!(self.app_server_target, AppServerTarget::Cloud)
             && self.chat_widget.thread_id() == Some(thread_id);
         let mut unfinished = HashSet::new();
@@ -312,17 +338,40 @@ impl App {
                 }
             }
         }
+        let turn_starts = turns
+            .iter()
+            .filter_map(|turn| {
+                let started_at = history_times::local_time(turn.started_at?)?;
+                Some((turn.id.as_str(), started_at))
+            })
+            .collect::<HashMap<_, _>>();
+        // Times are recorded once the cells are final: a recorded time keeps a weak reference,
+        // which would stop the cells from being updated in place below.
+        let mut times = HashMap::new();
         let mut cells = Vec::new();
         let mut split_images = Vec::new();
-        let project = |items: &[(String, ThreadItemPayload)]| {
-            thread_items_to_transcript_cells(
-                Some(thread_id),
-                cwd,
-                items.iter().map(|(_, item)| item.clone()),
-                visibility,
-                Some(&self.config),
-            )
-        };
+        let project =
+            |items: &[(String, ThreadItemPayload)],
+             times: &mut HashMap<usize, chrono::DateTime<chrono::Local>>| {
+                let (projected, sources) = thread_items_to_transcript_cells_with_sources(
+                    Some(thread_id),
+                    cwd,
+                    items.iter().map(|(_, item)| item.clone()),
+                    visibility,
+                    Some(&self.config),
+                );
+                // Date each entry by the item that started it, or by its turn's start.
+                for (cell, source) in projected.iter().zip(sources) {
+                    let (turn_id, item) = &items[source];
+                    if let Some(at) = item_time_ms(turn_id, item.id())
+                        .and_then(history_times::local_time_ms)
+                        .or_else(|| turn_starts.get(turn_id.as_str()).copied())
+                    {
+                        times.insert(history_times::key(cell), at);
+                    }
+                }
+                projected
+            };
         for (range, turn_end) in completion::group_turn_items(&items, turns) {
             let start = cells.len();
             // Internal prompts stay invisible, but still separate adjacent tool groups.
@@ -337,15 +386,14 @@ impl App {
                         unfinished.get(&key).cloned()
                     });
                     let split = chunk.len() - usize::from(anchor.is_some());
-                    cells.extend(project(&chunk[..split]));
+                    cells.extend(project(&chunk[..split], &mut times));
                     if let Some(key) = anchor {
-                        let mut cell =
-                            project(&chunk[split..])
-                                .into_iter()
-                                .next()
-                                .unwrap_or_else(|| {
-                                    Arc::new(history_cell::PendingAgentMessageCell(key.clone()))
-                                });
+                        let mut cell = project(&chunk[split..], &mut times)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_else(|| {
+                                Arc::new(history_cell::PendingAgentMessageCell(key.clone()))
+                            });
                         if let Some(markdown) = Arc::get_mut(&mut cell).and_then(|cell| {
                             cell.as_any_mut()
                                 .downcast_mut::<history_cell::AgentMarkdownCell>()
@@ -391,7 +439,15 @@ impl App {
                         .completion_cell(turn, Some(ReplayKind::ResumeInitialMessages))
                 }
             {
-                cells.push(Arc::new(completion));
+                let completion: Arc<dyn HistoryCell> = Arc::new(completion);
+                if let Some(completed_at) = turn
+                    .completed_at
+                    .or(turn.started_at)
+                    .and_then(history_times::local_time)
+                {
+                    times.insert(history_times::key(&completion), completed_at);
+                }
+                cells.push(completion);
             }
         }
         for cell in cells
@@ -400,6 +456,11 @@ impl App {
             .filter_map(Arc::get_mut)
         {
             self.link_viewed_image(cell);
+        }
+        for cell in cells.iter().chain(&split_images) {
+            if let Some(at) = times.get(&history_times::key(cell)) {
+                self.history_times.record(cell, *at);
+            }
         }
         (cells, split_images)
     }
@@ -538,11 +599,41 @@ fn split_image_insertion(
     )
 }
 
+/// Count the leading turns holding a page's items; older pages only reach the oldest turns.
+fn leading_page_turns(turns: &[Turn], items: &[(String, ThreadItemPayload)]) -> usize {
+    let mut remaining = items
+        .iter()
+        .map(|(turn_id, _)| turn_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut end = 0;
+    for (index, turn) in turns.iter().enumerate() {
+        if remaining.is_empty() {
+            break;
+        }
+        if remaining.remove(turn.id.as_str()) {
+            end = index + 1;
+        }
+    }
+    end
+}
+
 /// Classify internal review prompts across page boundaries before rendering any older items.
 pub(super) fn hidden_review_item_ids(turns: &[Turn]) -> HashSet<(&str, &str)> {
+    hidden_review_item_ids_through(turns, turns.len())
+}
+
+/// Like [`hidden_review_item_ids`], for a page that loaded the first `page_turns` turns.
+///
+/// Classification flows forward from the oldest turn. Past the first `page_turns` turns and the
+/// one after them, later turns keep their classification unless a review continues into them,
+/// so the scan stops there instead of revisiting the whole loaded thread for every page.
+fn hidden_review_item_ids_through(turns: &[Turn], page_turns: usize) -> HashSet<(&str, &str)> {
     let mut hidden = HashSet::new();
     let mut review_mode = false;
     for (index, turn) in turns.iter().enumerate() {
+        if index > page_turns && !review_mode {
+            break;
+        }
         let hidden_nested_review_turn = index
             .checked_sub(/*rhs*/ 1)
             .and_then(|previous| turns.get(previous))
@@ -601,28 +692,6 @@ fn hidden_transcript_indices(
         persisted_user_cells.truncate(position);
     }
     indices
-}
-
-/// Preserve events received while the request was in flight and deduplicate overlapping pages.
-fn merge_older_turns(current_turns: &mut Vec<Turn>, mut older_turns: Vec<Turn>) {
-    older_turns.retain_mut(|turn| {
-        let Some(current) = current_turns
-            .iter_mut()
-            .find(|current| current.id == turn.id)
-        else {
-            return true;
-        };
-        let items = std::mem::take(&mut turn.items)
-            .into_iter()
-            .filter(|item| !current.items.iter().any(|known| known.id() == item.id()))
-            .collect::<Vec<_>>();
-        if current.items_view == codex_app_server_protocol::TurnItemsView::NotLoaded {
-            current.items_view = turn.items_view;
-        }
-        current.items.splice(0..0, items);
-        false
-    });
-    current_turns.splice(0..0, older_turns);
 }
 
 #[cfg(test)]

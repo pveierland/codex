@@ -30,6 +30,8 @@ impl App {
                 return;
             };
             let range = start..newer_index;
+            self.history_times
+                .inherit(&self.transcript_cells[start], &older);
             self.native_history
                 .consolidate(&self.transcript_cells[range.clone()], &older);
             self.transcript_view
@@ -74,6 +76,8 @@ impl App {
             return;
         };
         let range = start..newer_index + 1;
+        self.history_times
+            .inherit(&self.transcript_cells[start], &group);
         self.native_history
             .consolidate(&self.transcript_cells[range.clone()], &group);
         self.transcript_view

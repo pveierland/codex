@@ -86,6 +86,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
         pending_server_profiles: HashMap::new(),
         file_search,
         transcript_cells: Vec::new(),
+        history_times: history_times::HistoryTimes::disabled(),
         native_history: Default::default(),
         turn_tips: Default::default(),
         transcript_view: Default::default(),

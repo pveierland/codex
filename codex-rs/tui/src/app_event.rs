@@ -1404,6 +1404,15 @@ pub(crate) enum AppEvent {
     FollowTranscript,
 
     InsertHistoryCell(Box<dyn HistoryCell>),
+    /// Date the history cells inserted after this as replayed history, until cleared.
+    /// It is queued in order with the replayed cells, so each takes the time of its own item:
+    /// the item's recorded time when the session knows it, otherwise `fallback`. Both `None`
+    /// returns to dating cells with the present.
+    HistoryReplayClock {
+        /// The replayed item as `(turn_id, item_id)`.
+        item: Option<(String, String)>,
+        fallback: Option<chrono::DateTime<chrono::Local>>,
+    },
     /// FIFO barrier after the completed turn's history insertions.
     TurnTipReady {
         thread_id: ThreadId,

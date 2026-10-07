@@ -871,6 +871,14 @@ impl App {
             );
             needs_redraw = false;
         }
+        if let Some(time) = view
+            .reading_top_entry(&self.transcript_cells, |cells, index| {
+                self.history_times.time_at(cells, index)
+            })
+            .flatten()
+        {
+            super::history_times::render_reading_time(time, transcript_area, frame.buffer);
+        }
         view.finish_collapse_layout(&self.transcript_cells);
         let blossom_tick = chat_widget
             .empty_state_animation
@@ -1274,31 +1282,9 @@ impl App {
                 return Ok(false);
             }
         }
-        // Raw pastes can arrive as thousands of Char/Enter/Tab events. Honor the composer's
-        // paste batching instead of rendering the entire screen before each buffered key.
-        // Keys owned by the transcript and non-text keys still need fresh geometry immediately.
         if let TuiEvent::Key(key) = event
             && key.kind != KeyEventKind::Release
-            && (!self.chat_widget.is_in_paste_burst()
-                || self.transcript_view.is_search_editing()
-                || self.transcript_view.is_activity_focused()
-                || self.transcript_view.owns_interaction_key(*key)
-                || self.backtrack.overlay_preview_active
-                || self.keymap.app.focus_activity.is_pressed(*key)
-                || self.keymap.app.find_transcript.is_pressed(*key)
-                || match key.code {
-                    KeyCode::Char(_) => {
-                        crate::key_hint::has_ctrl_or_alt(key.modifiers)
-                            || key.modifiers.intersects(
-                                KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META,
-                            )
-                    }
-                    KeyCode::Enter => {
-                        !matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
-                    }
-                    KeyCode::Tab => key.modifiers != KeyModifiers::NONE,
-                    _ => true,
-                })
+            && self.transcript_key_needs_layout(*key)
         {
             self.refresh_owned_transcript(tui)?;
         }
@@ -1544,6 +1530,49 @@ impl App {
         Ok(true)
     }
 
+    /// Whether a key may act on transcript geometry, which must match the latest state first.
+    ///
+    /// Text editing reaches the composer unchanged, so refreshing the transcript before it would
+    /// only paint every keystroke twice and let a typing burst queue full frames. Raw pastes can
+    /// also arrive as thousands of Char/Enter/Tab events, which the composer batches.
+    fn transcript_key_needs_layout(&self, key: KeyEvent) -> bool {
+        let plain = matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT);
+        let editing = plain
+            && matches!(
+                key.code,
+                KeyCode::Char(_)
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Left
+                    | KeyCode::Right
+            );
+        // Raw pastes can arrive as thousands of Char/Enter/Tab events. Honor the composer's
+        // paste batching instead of rendering the entire screen before each buffered key.
+        let pasted = self.chat_widget.is_in_paste_burst()
+            && match key.code {
+                KeyCode::Char(_) => {
+                    !crate::key_hint::has_ctrl_or_alt(key.modifiers)
+                        && !key.modifiers.intersects(
+                            KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META,
+                        )
+                }
+                KeyCode::Enter => plain,
+                KeyCode::Tab => key.modifiers == KeyModifiers::NONE,
+                _ => false,
+            };
+        // Keys owned by the transcript still need fresh geometry immediately.
+        let transcript_key = self.transcript_view.is_search_editing()
+            || self.transcript_view.is_activity_focused()
+            || self.transcript_view.owns_interaction_key(key)
+            || self.backtrack.overlay_preview_active
+            || self.keymap.app.find_transcript.is_pressed(key)
+            || self.keymap.app.focus_activity.is_pressed(key);
+        // Typing outside a paste only edits the composer, unless an interaction such as an
+        // accepted Find depends on the transcript's layout.
+        let composer_edit = editing && !self.transcript_view.has_active_interaction();
+        transcript_key || !(composer_edit || pasted)
+    }
+
     /// Keep the navigation hint and input guard aligned, including pending paste and attachments.
     fn enter_returns_to_latest(&self) -> bool {
         self.chat_widget.composer_is_empty()
@@ -1599,3 +1628,7 @@ mod warning_notice_tests;
 #[cfg(test)]
 #[path = "owned_transcript_follow_tests.rs"]
 mod follow_tests;
+
+#[cfg(test)]
+#[path = "input_latency_benchmark_tests.rs"]
+mod input_latency_benchmark_tests;

@@ -216,6 +216,7 @@ impl Requests {
                             output_deferred: false,
                             started_at_ms: entry.started_at_ms,
                             completed_at_ms: entry.completed_at_ms,
+                            created_at_ms: None,
                         })
                     })
                     .collect::<Vec<_>>();

@@ -632,6 +632,10 @@ impl TranscriptView {
                 ..anchor
             });
         }
+        if !inserted.is_empty() && self.pending_history_rows > 0 {
+            let rows = std::mem::take(&mut self.pending_history_rows);
+            self.scroll(cells, -isize::try_from(rows).unwrap_or(isize::MAX));
+        }
         if inserted.is_empty() {
             return;
         }
