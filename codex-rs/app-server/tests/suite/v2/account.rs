@@ -459,6 +459,95 @@ async fn startup_enforces_local_auth_requirements_before_cloud_fetch() -> Result
 }
 
 #[tokio::test]
+async fn account_switched_by_another_process_is_adopted_and_notified() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let mock_server = MockServer::start().await;
+    create_config_toml(
+        codex_home.path(),
+        CreateConfigTomlParams {
+            requires_openai_auth: Some(true),
+            base_url: Some(format!("{}/v1", mock_server.uri())),
+            ..Default::default()
+        },
+    )?;
+    write_models_cache(codex_home.path()).await?;
+    let account = |token: &str, id: &str, email: &str| {
+        ChatGptAuthFixture::new(token)
+            .plan_type("pro")
+            .chatgpt_user_id(format!("user-{id}"))
+            .chatgpt_account_id(id)
+            .account_id(id)
+            .email(email)
+    };
+    write_chatgpt_auth(
+        codex_home.path(),
+        account("first-token", WORKSPACE_ID_INITIAL, "first@example.com"),
+        AuthCredentialsStoreMode::File,
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_mock_chatgpt_backend()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    assert_eq!(
+        read_account(&mut mcp).await?.account,
+        Some(Account::Chatgpt {
+            email: Some("first@example.com".to_string()),
+            plan_type: AccountPlanType::Pro,
+        })
+    );
+
+    // Switch accounts the way account switchers do: rename a complete file over auth.json.
+    let staging = TempDir::new_in(codex_home.path())?;
+    write_chatgpt_auth(
+        staging.path(),
+        account(
+            "second-token",
+            WORKSPACE_ID_SECOND_ALLOWED,
+            "second@example.com",
+        ),
+        AuthCredentialsStoreMode::File,
+    )?;
+    std::fs::rename(
+        staging.path().join("auth.json"),
+        codex_home.path().join("auth.json"),
+    )?;
+
+    let second = Some(Account::Chatgpt {
+        email: Some("second@example.com".to_string()),
+        plan_type: AccountPlanType::Pro,
+    });
+    // Startup announces the first account too, so wait for the update that carries the switch.
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let payload: AccountUpdatedNotification =
+                mcp.read_notification("account/updated").await?;
+            assert_eq!(
+                payload,
+                AccountUpdatedNotification {
+                    auth_mode: Some(AuthMode::Chatgpt),
+                    plan_type: Some(AccountPlanType::Pro),
+                }
+            );
+            if read_account(&mut mcp).await?.account == second {
+                return anyhow::Ok(());
+            }
+        }
+    })
+    .await??;
+
+    // A missing file mid-switch keeps the current account instead of signing out.
+    std::fs::remove_file(codex_home.path().join("auth.json"))?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(read_account(&mut mcp).await?.account, second);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn set_auth_token_updates_account_and_notifies() -> Result<()> {
     let codex_home = TempDir::new()?;
     let mock_server = MockServer::start().await;

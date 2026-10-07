@@ -1365,7 +1365,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[tokio::test]
-    async fn fetch_thread_usage_uses_app_server_auth_after_persisted_account_changes() {
+    async fn fetch_thread_usage_adopts_a_persisted_account_switch() {
         let mut app = make_test_app().await;
         let server = wiremock::MockServer::start().await;
         let thread_id = ThreadId::new();
@@ -1409,11 +1409,11 @@ mod tests {
             ))
             .and(wiremock::matchers::header(
                 "authorization",
-                "Bearer chatgpt-token",
+                "Bearer different-token",
             ))
             .and(wiremock::matchers::header(
                 "chatgpt-account-id",
-                "account-123",
+                "different-account",
             ))
             .and(wiremock::matchers::body_json(serde_json::json!({
                 "thread_ids": [thread_id.to_string()]
@@ -1431,17 +1431,26 @@ mod tests {
             .mount(&server)
             .await;
 
-        assert_eq!(
-            fetch_thread_usage(app_server.request_handle(), thread_id)
-                .await
-                .expect("read thread usage through the authenticated app server"),
-            ThreadUsageOutcome::Available(ThreadUsage {
-                thread_id: thread_id.to_string(),
-                estimated_usage_credits_micros: 46_000_000,
-                estimated_usage_usd_micros: Some(1_820_000),
-                groups: Vec::new(),
-            })
-        );
+        let expected = ThreadUsageOutcome::Available(ThreadUsage {
+            thread_id: thread_id.to_string(),
+            estimated_usage_credits_micros: 46_000_000,
+            estimated_usage_usd_micros: Some(1_820_000),
+            groups: Vec::new(),
+        });
+        // The app server adopts the switched account once its file watcher settles.
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(/*secs*/ 10);
+        loop {
+            let outcome = fetch_thread_usage(app_server.request_handle(), thread_id).await;
+            if outcome.as_ref().ok() == Some(&expected) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "switched account was not adopted: {outcome:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(/*millis*/ 50)).await;
+        }
     }
 
     fn test_absolute_path(path: &str) -> AbsolutePathBuf {

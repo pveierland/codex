@@ -27,7 +27,7 @@ use wiremock::matchers::path;
 const DEFAULT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(/*secs*/ 30);
 
 #[tokio::test]
-async fn account_thread_usage_uses_active_workspace_and_canonical_thread_ids() -> Result<()> {
+async fn account_thread_usage_uses_adopted_workspace_and_canonical_thread_ids() -> Result<()> {
     let thread_id = "019fc8ab-1fb2-7000-8000-000000000123";
     let codex_home = TempDir::new()?;
     let server = MockServer::start().await;
@@ -46,16 +46,17 @@ async fn account_thread_usage_uses_active_workspace_and_canonical_thread_ids() -
         .with_env_overrides(&[("OPENAI_API_KEY", None)])
         .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
         .await?;
+    // Another process, such as an account switcher, stores a different account.
     write_chatgpt_auth(
         codex_home.path(),
-        ChatGptAuthFixture::new("different-token").account_id("different-workspace"),
+        ChatGptAuthFixture::new("switched-token").account_id("switched-workspace"),
         AuthCredentialsStoreMode::File,
     )?;
 
     Mock::given(method("POST"))
         .and(path("/api/codex/usage/thread_usage/query"))
-        .and(header("authorization", "Bearer active-token"))
-        .and(header("chatgpt-account-id", "active-workspace"))
+        .and(header("authorization", "Bearer switched-token"))
+        .and(header("chatgpt-account-id", "switched-workspace"))
         .and(body_json(json!({ "thread_ids": [thread_id] })))
         .respond_with(ResponseTemplate::new(/*s*/ 200).set_body_json(json!({
             "threads": [{
@@ -79,14 +80,26 @@ async fn account_thread_usage_uses_active_workspace_and_canonical_thread_ids() -
         .mount(&server)
         .await;
 
-    let request_id = app_server
-        .send_raw_request(
-            "account/usage/read",
-            Some(json!({ "threadId": "019FC8AB-1FB2-7000-8000-000000000123" })),
-        )
-        .await?;
-    let response: GetAccountTokenUsageResponse =
-        timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(request_id)).await??;
+    // Requests made before the server adopts the stored account still use the previous one.
+    let response: GetAccountTokenUsageResponse = timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let request_id = app_server
+                .send_raw_request(
+                    "account/usage/read",
+                    Some(json!({ "threadId": "019FC8AB-1FB2-7000-8000-000000000123" })),
+                )
+                .await?;
+            let request_id = RequestId::Integer(request_id);
+            match app_server
+                .read_stream_until_response_or_error_message(request_id)
+                .await?
+            {
+                Ok(response) => return anyhow::Ok(serde_json::from_value(response.result)?),
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await??;
 
     assert_eq!(
         response,

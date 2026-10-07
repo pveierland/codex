@@ -1708,6 +1708,24 @@ impl TestAppServer {
         Ok(err)
     }
 
+    /// Reads the response or error that answers `request_id`.
+    pub async fn read_stream_until_response_or_error_message(
+        &mut self,
+        request_id: RequestId,
+    ) -> anyhow::Result<Result<JSONRPCResponse, JSONRPCError>> {
+        let message = self
+            .read_stream_until_message(|message| {
+                Self::message_request_id(message) == Some(&request_id)
+            })
+            .await?;
+
+        match message {
+            JSONRPCMessage::Response(response) => Ok(Ok(response)),
+            JSONRPCMessage::Error(err) => Ok(Err(err)),
+            message => unreachable!("expected a response or error, got {message:?}"),
+        }
+    }
+
     pub async fn read_stream_until_notification_message(
         &mut self,
         method: &str,
