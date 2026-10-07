@@ -9,6 +9,7 @@ use crossterm::event::Event;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
+use crossterm::event::TerminalEvent;
 use pretty_assertions::assert_eq;
 use ratatui::layout::Position;
 use ratatui::layout::Rect;
@@ -22,8 +23,8 @@ use crate::custom_terminal::Terminal;
 use crate::test_backend::VT100Backend;
 use crate::tui::TuiEvent;
 use crate::tui::event_stream::EventBroker;
-use crate::tui::event_stream::EventResult;
 use crate::tui::event_stream::EventSource;
+use crate::tui::event_stream::SourceResult;
 use crate::tui::event_stream::TuiEventStream;
 
 #[derive(Default)]
@@ -32,15 +33,15 @@ struct KeySource {
 }
 
 impl EventSource for KeySource {
-    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<EventResult>> {
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<SourceResult>> {
         if self.sent {
             return Poll::Pending;
         }
         self.sent = true;
-        Poll::Ready(Some(Ok(Event::Key(KeyEvent::new(
+        Poll::Ready(Some(Ok(TerminalEvent::Input(Event::Key(KeyEvent::new(
             KeyCode::Char('x'),
             KeyModifiers::NONE,
-        )))))
+        ))))))
     }
 }
 
