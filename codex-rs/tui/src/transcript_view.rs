@@ -21,6 +21,7 @@ mod selection;
 mod snapshot;
 mod text;
 mod turn_tip;
+mod wheel;
 
 use std::sync::Arc;
 
@@ -76,6 +77,9 @@ enum Position {
     Reading(Anchor),
 }
 
+/// An entry's index, layout, key, and displayed activity ids, resolved once per frame.
+type RenderedEntry = (usize, Arc<TextLayout>, EntryKey, Arc<[String]>);
+
 struct VisibleRow {
     index: usize,
     row: usize,
@@ -88,6 +92,10 @@ struct VisibleRow {
 pub(crate) struct TranscriptView {
     pub(crate) mouse_scroll_speed: f64,
     pending_mouse_scroll: f64,
+    wheel_flick: wheel::Flick,
+    unseen_wheel: Option<wheel::UnseenScroll>,
+    /// Upward rows requested beyond the oldest loaded entry, applied as older pages arrive.
+    pending_history_rows: usize,
     pub(crate) copy_on_select: bool,
     pub(crate) primary_selection: bool,
     position: Position,
@@ -124,6 +132,9 @@ impl Default for TranscriptView {
         Self {
             mouse_scroll_speed: 1.0,
             pending_mouse_scroll: 0.0,
+            wheel_flick: wheel::Flick::default(),
+            unseen_wheel: None,
+            pending_history_rows: 0,
             copy_on_select: false,
             primary_selection: false,
             position: Position::Latest,
@@ -174,6 +185,8 @@ impl TranscriptView {
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer, cells: &[Arc<dyn HistoryCell>]) {
         self.composer_tip = None;
         self.cache.begin_frame();
+        // Wheel motion applied before this frame is about to be seen.
+        self.unseen_wheel = None;
         self.sync_history_tail(cells);
         let current_cells = cells;
         let snapshot = self.snapshot_cells();
@@ -231,9 +244,14 @@ impl TranscriptView {
         }
         let area = body;
         let (mut index, mut row) = start;
-        let mut entry_activity_ids: Option<(usize, Arc<[String]>)> = None;
+        // Resolve each entry once per frame, not once per row it covers.
+        let mut entry: Option<RenderedEntry> = None;
         for y in area.top()..area.bottom() {
-            let Some(layout) = self.layout(cells, index) else {
+            let current = match &entry {
+                Some((current, layout, ..)) if *current == index => Some(Arc::clone(layout)),
+                _ => self.layout(cells, index),
+            };
+            let Some(mut layout) = current else {
                 break;
             };
             if row >= layout.row_count() {
@@ -244,19 +262,20 @@ impl TranscriptView {
                     break;
                 };
                 index = next;
+                let Some(next_layout) = self.layout(cells, index) else {
+                    break;
+                };
+                layout = next_layout;
             }
-            let Some(layout) = self.layout(cells, index) else {
+            if entry.as_ref().is_none_or(|(current, ..)| *current != index) {
+                let key = self.entry_key(cells, index);
+                let ids = self.displayed_activity_ids(cells, index);
+                entry = Some((index, Arc::clone(&layout), key, ids));
+            }
+            let Some((_, _, key, activity_ids)) = &entry else {
                 break;
             };
-            let key = self.entry_key(cells, index);
-            let activity_ids = match &entry_activity_ids {
-                Some((previous, ids)) if *previous == index => Arc::clone(ids),
-                _ => {
-                    let ids = self.displayed_activity_ids(cells, index);
-                    entry_activity_ids = Some((index, Arc::clone(&ids)));
-                    ids
-                }
-            };
+            let (key, activity_ids) = (*key, Arc::clone(activity_ids));
             let row_area = Rect::new(area.x, y, area.width, /*height*/ 1);
             layout.render(row_area, buf, row);
             self.render_disclosure(&activity_ids, &layout, row, row_area, buf);
@@ -381,8 +400,24 @@ impl TranscriptView {
         self.selection.is_none() && self.position == Position::Latest
     }
 
+    /// Apply `f` to the displayed cells and the index of the entry at the top of the last
+    /// frame, while reading away from the latest output.
+    pub(crate) fn reading_top_entry<R>(
+        &self,
+        cells: &[Arc<dyn HistoryCell>],
+        f: impl FnOnce(&[Arc<dyn HistoryCell>], usize) -> R,
+    ) -> Option<R> {
+        if self.position == Position::Latest {
+            return None;
+        }
+        let index = self.visible.first()?.index;
+        let snapshot = self.snapshot_cells();
+        Some(f(snapshot.as_deref().unwrap_or(cells), index))
+    }
+
     /// Hold the current reading position until every older page has arrived.
     pub(crate) fn jump_to_beginning(&mut self, cells: &[Arc<dyn HistoryCell>]) {
+        self.pending_history_rows = 0;
         if self.history == TranscriptHistoryState::LoadingBeginning {
             return;
         }
@@ -395,6 +430,7 @@ impl TranscriptView {
     }
 
     pub(crate) fn jump_to_latest(&mut self) {
+        self.pending_history_rows = 0;
         self.cancel_search();
         self.cancel_beginning();
         self.position = Position::Latest;
@@ -410,6 +446,9 @@ impl TranscriptView {
             self.last_click = None;
             self.cancel_beginning();
         }
+        if rows > 0 {
+            self.pending_history_rows = 0;
+        }
         if self.area.is_empty() {
             return;
         }
@@ -417,7 +456,12 @@ impl TranscriptView {
         let snapshot = self.snapshot_cells();
         let cells = snapshot.as_deref().unwrap_or(cells);
         let start = self.start(cells);
-        let (index, row) = self.move_rows(cells, start.0, start.1, rows);
+        let (index, row, unmet) = self.move_rows_clamped(cells, start.0, start.1, rows);
+        // Keep a long upward scroll going once older pages arrive instead of stopping at the
+        // oldest loaded entry.
+        if self.history.has_unloaded_history() {
+            self.pending_history_rows += unmet;
+        }
         if rows < 0
             && (index, row) == start
             && self.is_following()
@@ -455,6 +499,7 @@ impl TranscriptView {
     }
 
     pub(crate) fn jump_to_entry(&mut self, cells: &[Arc<dyn HistoryCell>], index: usize) {
+        self.pending_history_rows = 0;
         self.cancel_beginning();
         self.release_live_reading();
         let snapshot = self.snapshot_cells();
@@ -573,10 +618,22 @@ impl TranscriptView {
     fn move_rows(
         &mut self,
         cells: &[Arc<dyn HistoryCell>],
+        index: usize,
+        row: usize,
+        rows: isize,
+    ) -> (usize, usize) {
+        let (index, row, _) = self.move_rows_clamped(cells, index, row, rows);
+        (index, row)
+    }
+
+    /// Move like `move_rows`, also reporting upward rows that did not fit above the first entry.
+    fn move_rows_clamped(
+        &mut self,
+        cells: &[Arc<dyn HistoryCell>],
         mut index: usize,
         mut row: usize,
         rows: isize,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, usize) {
         if rows < 0 {
             let mut remaining = rows.unsigned_abs();
             while remaining > row && index > 0 {
@@ -593,9 +650,13 @@ impl TranscriptView {
                 && let Some(first) = self.next_nonempty(cells, index)
                 && let Some(layout) = self.layout(cells, first)
             {
-                return (first, usize::from(layout.separated));
+                return (first, usize::from(layout.separated), remaining - row);
             }
-            return (index, row.saturating_sub(remaining));
+            return (
+                index,
+                row.saturating_sub(remaining),
+                remaining.saturating_sub(row),
+            );
         }
         let mut remaining = row.saturating_add(rows as usize);
         while let Some(layout) = self.layout(cells, index) {
@@ -605,7 +666,7 @@ impl TranscriptView {
             remaining -= layout.row_count();
             index += 1;
         }
-        (index, remaining)
+        (index, remaining, 0)
     }
 
     fn next_nonempty(&mut self, cells: &[Arc<dyn HistoryCell>], mut index: usize) -> Option<usize> {

@@ -15,4 +15,9 @@ startedAtMs: number | null,
 /**
  * Unix timestamp (milliseconds) when the item completed, if recorded by the producer.
  */
-completedAtMs: number | null, };
+completedAtMs: number | null,
+/**
+ * Unix timestamp (milliseconds) when the item first appeared in the thread. Stored items
+ * always have it, including those whose producer recorded no lifecycle times.
+ */
+createdAtMs: number | null, };

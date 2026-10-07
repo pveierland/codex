@@ -79,7 +79,10 @@ fn decimal_mouse_scroll_speeds_preserve_whole_rows() {
         ] {
             let (_, start_row) = view.start(&cells);
             for event in 1..=100 {
+                // Separate notches keep the base step; flicks are covered by the wheel tests.
+                view.wheel_flick = Default::default();
                 view.handle_mouse(mouse(kind, /*column*/ 1, /*row*/ 1), &cells);
+                view.render(area, &mut Buffer::empty(area), &cells);
                 let rows = (f64::from(event) * speed).floor() as isize * direction;
                 assert_eq!(
                     view.start(&cells),
@@ -89,6 +92,122 @@ fn decimal_mouse_scroll_speeds_preserve_whole_rows() {
         }
         assert_eq!(view.start(&cells), (index, row));
     }
+}
+
+fn numbered_rows(prefix: &str, count: usize) -> Arc<dyn HistoryCell> {
+    Arc::new(crate::history_cell::PlainHistoryCell::new(
+        (0..count)
+            .map(|row| format!("{prefix} {row:03}").into())
+            .collect(),
+    ))
+}
+
+#[test]
+fn an_opposite_notch_stops_wheel_motion_not_yet_on_screen() {
+    let cells = vec![numbered_rows("row", /*count*/ 120)];
+    let area = Rect::new(
+        /*x*/ 0, /*y*/ 0, /*width*/ 12, /*height*/ 4,
+    );
+    let mut view = TranscriptView::default();
+    view.render(area, &mut Buffer::empty(area), &cells);
+    view.scroll(&cells, /*rows*/ -40);
+    view.render(area, &mut Buffer::empty(area), &cells);
+    let shown = view.start(&cells);
+
+    // A flick queued behind one frame, then one opposite notch before the next frame.
+    for _ in 0..10 {
+        view.handle_mouse(
+            mouse(MouseEventKind::ScrollUp, /*column*/ 1, /*row*/ 1),
+            &cells,
+        );
+    }
+    assert_ne!(view.start(&cells), shown);
+    assert!(matches!(
+        view.handle_mouse(
+            mouse(
+                MouseEventKind::ScrollDown,
+                /*column*/ 1,
+                /*row*/ 1
+            ),
+            &cells
+        ),
+        Some(ViewAction::Changed)
+    ));
+    assert_eq!(view.start(&cells), shown);
+
+    // The stop is spent; further notches scroll from where the user stopped.
+    view.handle_mouse(
+        mouse(
+            MouseEventKind::ScrollDown,
+            /*column*/ 1,
+            /*row*/ 1,
+        ),
+        &cells,
+    );
+    assert_eq!(view.start(&cells), (shown.0, shown.1 + 1));
+}
+
+#[test]
+fn an_opposite_notch_after_a_frame_scrolls_normally() {
+    let cells = vec![numbered_rows("row", /*count*/ 120)];
+    let area = Rect::new(
+        /*x*/ 0, /*y*/ 0, /*width*/ 12, /*height*/ 4,
+    );
+    let mut view = TranscriptView::default();
+    view.render(area, &mut Buffer::empty(area), &cells);
+    view.scroll(&cells, /*rows*/ -40);
+    view.handle_mouse(
+        mouse(MouseEventKind::ScrollUp, /*column*/ 1, /*row*/ 1),
+        &cells,
+    );
+    view.render(area, &mut Buffer::empty(area), &cells);
+    let shown = view.start(&cells);
+
+    view.handle_mouse(
+        mouse(
+            MouseEventKind::ScrollDown,
+            /*column*/ 1,
+            /*row*/ 1,
+        ),
+        &cells,
+    );
+    assert_eq!(view.start(&cells), (shown.0, shown.1 + 1));
+}
+
+#[test]
+fn an_opposite_notch_drops_rows_waiting_for_older_history() {
+    let mut cells = vec![numbered_rows("current", /*count*/ 10)];
+    let area = Rect::new(
+        /*x*/ 0, /*y*/ 0, /*width*/ 20, /*height*/ 3,
+    );
+    let mut view = TranscriptView {
+        history: TranscriptHistoryState::Partial,
+        ..TranscriptView::default()
+    };
+    view.render(area, &mut Buffer::empty(area), &cells);
+    // Seven rows reach the oldest loaded row; five more wait for older history.
+    view.scroll(&cells, /*rows*/ -12);
+    view.render(area, &mut Buffer::empty(area), &cells);
+    assert_eq!(view.start(&cells), (0, 0));
+
+    view.handle_mouse(
+        mouse(
+            MouseEventKind::ScrollDown,
+            /*column*/ 1,
+            /*row*/ 1,
+        ),
+        &cells,
+    );
+    assert_eq!(view.start(&cells), (0, 0));
+    cells.insert(/*index*/ 0, numbered_rows("older", /*count*/ 10));
+    view.history = TranscriptHistoryState::Complete;
+    view.history_loaded(&cells, 0..1);
+    let mut buf = Buffer::empty(area);
+    view.render(area, &mut buf, &cells);
+    let top = (0..area.width)
+        .map(|x| buf[(x, 0)].symbol())
+        .collect::<String>();
+    assert_eq!(top.trim_end(), "current 000");
 }
 
 #[test]

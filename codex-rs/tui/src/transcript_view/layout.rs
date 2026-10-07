@@ -6,11 +6,14 @@
 use crate::history_cell::ActivityDisclosure;
 use crate::key_hint::ShortcutHint;
 use crate::keymap::KeymapContext;
+use std::collections::HashMap;
 use std::sync::Weak;
 
 use super::*;
 
-const MAX_CACHED_ENTRIES: usize = 64;
+/// Enough entries for a tall screen of short entries plus the rows scrolled past, so a frame
+/// never evicts layouts it is about to reuse.
+const MAX_CACHED_ENTRIES: usize = 1024;
 const MAX_CACHED_TEXT_BYTES: usize = 8 * 1024 * 1024;
 
 /// The selected activity presentation and any live content that follows it.
@@ -59,8 +62,13 @@ pub(super) fn activity_layout(
 
 #[derive(Default)]
 pub(super) struct LayoutCache {
-    entries: Vec<CachedLayout>,
+    /// One entry per source cell, keyed by its allocation; the weak reference keeps the key from
+    /// being reused while the entry exists.
+    entries: HashMap<usize, CachedLayout>,
     frame: u64,
+    /// Increases on every lookup, ordering entries for least-recently-used eviction.
+    clock: u64,
+    text_bytes: usize,
     render_state: Option<RenderState>,
 }
 
@@ -73,12 +81,18 @@ struct RenderState {
 }
 
 struct CachedLayout {
-    source: Weak<dyn HistoryCell>,
+    /// Holds the source allocation so its address, the entry's key, is not reused.
+    _source: Weak<dyn HistoryCell>,
     width: u16,
     presentation: CellPresentation,
     layout: Arc<TextLayout>,
     rendered_frame: u64,
     animation_tick: Option<u64>,
+    last_used: u64,
+}
+
+fn cache_key(cell: &Arc<dyn HistoryCell>) -> usize {
+    Arc::as_ptr(cell).cast::<()>() as usize
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -225,7 +239,7 @@ impl LayoutCache {
             color_level: crate::terminal_palette::stdout_color_level(),
         };
         if self.render_state.as_ref() != Some(&state) {
-            self.entries.clear();
+            self.clear();
             self.render_state = Some(state);
         }
     }
@@ -237,22 +251,17 @@ impl LayoutCache {
         presentation: CellPresentation,
         render: impl FnOnce() -> TextLayout,
     ) -> Arc<TextLayout> {
-        let source = Arc::downgrade(cell);
+        let key = cache_key(cell);
         let animation_tick = cell.transcript_animation_tick();
-        if let Some(index) = self.entries.iter().position(|entry| {
-            entry.width == width
-                && entry.presentation == presentation
-                && entry.source.ptr_eq(&source)
-                && (entry.rendered_frame == self.frame
-                    || (cell.has_stable_transcript_height()
-                        && entry.animation_tick == animation_tick))
-        }) {
-            let layout = Arc::clone(&self.entries[index].layout);
-            if index + 1 != self.entries.len() {
-                let entry = self.entries.remove(index);
-                self.entries.push(entry);
-            }
-            return layout;
+        self.clock += 1;
+        if let Some(entry) = self.entries.get_mut(&key)
+            && entry.width == width
+            && entry.presentation == presentation
+            && (entry.rendered_frame == self.frame
+                || (cell.has_stable_transcript_height() && entry.animation_tick == animation_tick))
+        {
+            entry.last_used = self.clock;
+            return Arc::clone(&entry.layout);
         }
         let layout = render();
         let layout = if presentation.separated {
@@ -265,34 +274,51 @@ impl LayoutCache {
         } else {
             layout
         });
-        self.entries.retain(|entry| !entry.source.ptr_eq(&source));
-        self.entries.push(CachedLayout {
-            source,
-            width,
-            presentation,
-            layout: Arc::clone(&layout),
-            rendered_frame: self.frame,
-            animation_tick,
-        });
+        self.text_bytes += layout.text().len();
+        if let Some(replaced) = self.entries.insert(
+            key,
+            CachedLayout {
+                _source: Arc::downgrade(cell),
+                width,
+                presentation,
+                layout: Arc::clone(&layout),
+                rendered_frame: self.frame,
+                animation_tick,
+                last_used: self.clock,
+            },
+        ) {
+            self.text_bytes -= replaced.layout.text().len();
+        }
         self.evict();
         layout
     }
 
     pub(super) fn clear(&mut self) {
         self.entries.clear();
+        self.text_bytes = 0;
     }
 
+    /// Drop least recently used entries, a quarter of the limit at a time so eviction stays
+    /// rare. Retain the newest entry even when oversized rather than repeatedly laying it out.
     fn evict(&mut self) {
-        let mut bytes = self
+        if self.entries.len() <= MAX_CACHED_ENTRIES && self.text_bytes <= MAX_CACHED_TEXT_BYTES {
+            return;
+        }
+        let mut by_age = self
             .entries
             .iter()
-            .map(|entry| entry.layout.text().len())
-            .sum::<usize>();
-        // Retain a single oversized entry rather than repeatedly laying it out while visible.
-        while self.entries.len() > 1
-            && (self.entries.len() > MAX_CACHED_ENTRIES || bytes > MAX_CACHED_TEXT_BYTES)
-        {
-            bytes -= self.entries.remove(/*index*/ 0).layout.text().len();
+            .map(|(key, entry)| (entry.last_used, *key))
+            .collect::<Vec<_>>();
+        by_age.sort_unstable();
+        let keep_entries = MAX_CACHED_ENTRIES - MAX_CACHED_ENTRIES / 4;
+        let keep_bytes = MAX_CACHED_TEXT_BYTES - MAX_CACHED_TEXT_BYTES / 4;
+        for (_, key) in &by_age[..by_age.len() - 1] {
+            if self.entries.len() <= keep_entries && self.text_bytes <= keep_bytes {
+                break;
+            }
+            if let Some(entry) = self.entries.remove(key) {
+                self.text_bytes -= entry.layout.text().len();
+            }
         }
     }
 }

@@ -28,11 +28,13 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
+use std::time::Duration;
 
 use crossterm::event::Event;
 use crossterm::event::TerminalEvent;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::WatchStream;
@@ -40,6 +42,13 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use super::TuiEvent;
 use super::size_monitor::SizeMonitor;
+
+/// How long a due frame may wait while already-queued input is handled first.
+///
+/// Draining input before drawing makes a burst, such as a fast wheel flick, cost one frame
+/// instead of one frame per event, so later input like a reversing notch acts at once. The bound
+/// keeps the screen updating when input arrives faster than it can be handled.
+const DRAW_DEFERRAL_LIMIT: Duration = Duration::from_millis(/*millis*/ 50);
 
 /// Result type for terminal input events.
 #[cfg(any(windows, test))]
@@ -260,7 +269,8 @@ pub struct TuiEventStream<S: EventSource + Default + Unpin = CrosstermEventSourc
     draw_stream: BroadcastStream<()>,
     resume_stream: WatchStream<()>,
     terminal_focused: Arc<AtomicBool>,
-    poll_draw_first: bool,
+    /// A due frame held back while queued input is handled, and when it became due.
+    pending_draw: Option<(TuiEvent, Instant)>,
     #[cfg(unix)]
     suspend_context: crate::tui::job_control::SuspendContext,
     #[cfg(unix)]
@@ -281,7 +291,7 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
             draw_stream: BroadcastStream::new(draw_rx),
             resume_stream,
             terminal_focused,
-            poll_draw_first: false,
+            pending_draw: None,
             #[cfg(unix)]
             suspend_context,
             #[cfg(unix)]
@@ -429,27 +439,29 @@ impl<S: EventSource + Default + Unpin> Stream for TuiEventStream<S> {
     type Item = TuiEvent;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // approximate fairness + no starvation via round-robin.
-        let draw_first = self.poll_draw_first;
-        self.poll_draw_first = !self.poll_draw_first;
-
-        if draw_first {
-            if let Poll::Ready(event) = self.poll_draw_event(cx) {
-                return Poll::Ready(event);
-            }
-            if let Poll::Ready(event) = self.poll_crossterm_event(cx) {
-                return Poll::Ready(event);
-            }
-        } else {
-            if let Poll::Ready(event) = self.poll_crossterm_event(cx) {
-                return Poll::Ready(event);
-            }
-            if let Poll::Ready(event) = self.poll_draw_event(cx) {
-                return Poll::Ready(event);
+        // Input first: each queued event would otherwise wait for a full frame, so a burst of
+        // wheel notches or keys would replay one frame at a time.
+        if self.pending_draw.is_none() {
+            match self.poll_draw_event(cx) {
+                Poll::Ready(Some(event)) => self.pending_draw = Some((event, Instant::now())),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => {}
             }
         }
-
-        Poll::Pending
+        if self
+            .pending_draw
+            .as_ref()
+            .is_some_and(|(_, due)| due.elapsed() >= DRAW_DEFERRAL_LIMIT)
+        {
+            return Poll::Ready(self.pending_draw.take().map(|(event, _)| event));
+        }
+        if let Poll::Ready(event) = self.poll_crossterm_event(cx) {
+            return Poll::Ready(event);
+        }
+        match self.pending_draw.take() {
+            Some((event, _)) => Poll::Ready(Some(event)),
+            None => Poll::Pending,
+        }
     }
 }
 
@@ -687,6 +699,44 @@ mod tests {
         }
 
         assert!(saw_draw && saw_key, "expected both draw and key events");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn queued_input_is_handled_before_a_due_frame() {
+        let (broker, handle, draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let _ = draw_tx.send(());
+        for _ in 0..3 {
+            handle.send(Ok(Event::Mouse(wheel)));
+        }
+
+        for _ in 0..3 {
+            assert!(matches!(stream.next().await, Some(TuiEvent::Mouse(_))));
+        }
+        assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn sustained_input_cannot_hold_back_a_frame_indefinitely() {
+        let (broker, handle, draw_tx, draw_rx, terminal_focused) = setup();
+        let mut stream = make_stream(broker, draw_rx, terminal_focused);
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+
+        let _ = draw_tx.send(());
+        handle.send(Ok(Event::Key(key)));
+        handle.send(Ok(Event::Key(key)));
+        assert!(matches!(stream.next().await, Some(TuiEvent::Key(_))));
+
+        tokio::time::advance(DRAW_DEFERRAL_LIMIT).await;
+        assert!(matches!(stream.next().await, Some(TuiEvent::Draw)));
+        assert!(matches!(stream.next().await, Some(TuiEvent::Key(_))));
     }
 
     #[tokio::test(flavor = "current_thread")]

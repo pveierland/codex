@@ -227,6 +227,7 @@ mod experimental_features;
 mod feedback_upload;
 mod file_change_approvals;
 mod history_pagination;
+mod history_times;
 mod history_ui;
 mod input;
 mod link_hover;
@@ -553,6 +554,7 @@ pub(crate) struct App {
     pub(crate) file_search: FileSearchManager,
 
     pub(crate) transcript_cells: Vec<Arc<dyn HistoryCell>>,
+    history_times: history_times::HistoryTimes,
     native_history: native_history::NativeHistory,
     turn_tips: turn_tips::TurnTips,
     pub(crate) transcript_view: crate::transcript_view::TranscriptView,

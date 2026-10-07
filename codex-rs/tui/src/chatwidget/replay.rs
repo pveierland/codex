@@ -114,6 +114,7 @@ impl ChatWidget {
                 crate::app_backtrack::is_hidden_nested_review_turn(&turns[0], &turns[1])
             }))
             .collect::<Vec<_>>();
+        let mut replayed_turns = false;
         for (turn, hidden_nested_review_turn) in turns.into_iter().zip(hidden_nested_review_turns) {
             self.restore_realtime_transcripts_before_turn(&turn.id);
             // Defer completed metadata-only turns until their page loads. Active
@@ -135,6 +136,12 @@ impl ChatWidget {
                 completed_at,
                 duration_ms,
             } = turn;
+            let turn_time = local_unix_time(started_at);
+            self.app_event_tx.send(AppEvent::HistoryReplayClock {
+                item_id: None,
+                fallback: turn_time,
+            });
+            replayed_turns = true;
             let delegated = items.iter().any(|item| {
                 matches!(item, ThreadItem::UserMessage { content, .. }
                     if realtime::realtime_delegation_input(content).is_some())
@@ -157,6 +164,10 @@ impl ChatWidget {
                 });
             let mut replaying_delegation = false;
             for item in items {
+                self.app_event_tx.send(AppEvent::HistoryReplayClock {
+                    item_id: Some(item.id().to_string()),
+                    fallback: turn_time,
+                });
                 if matches!(&item, ThreadItem::UserMessage { content, .. }
                     if realtime::realtime_delegation_input(content).is_some())
                 {
@@ -220,6 +231,10 @@ impl ChatWidget {
                 status,
                 TurnStatus::Completed | TurnStatus::Interrupted | TurnStatus::Failed
             ) {
+                self.app_event_tx.send(AppEvent::HistoryReplayClock {
+                    item_id: None,
+                    fallback: local_unix_time(completed_at.or(started_at)),
+                });
                 self.handle_turn_completed_notification(
                     TurnCompletedNotification {
                         thread_id: self.thread_id.map(|id| id.to_string()).unwrap_or_default(),
@@ -238,6 +253,13 @@ impl ChatWidget {
                     Some(replay_kind),
                 );
             }
+        }
+        if replayed_turns {
+            // Cells flushed after the replay, such as the live tail, happened now.
+            self.app_event_tx.send(AppEvent::HistoryReplayClock {
+                item_id: None,
+                fallback: None,
+            });
         }
     }
 
@@ -482,4 +504,13 @@ impl ChatWidget {
             self.request_redraw();
         }
     }
+}
+
+/// Convert a turn's recorded Unix seconds to local time.
+fn local_unix_time(unix_seconds: Option<i64>) -> Option<chrono::DateTime<chrono::Local>> {
+    use chrono::TimeZone;
+
+    chrono::Local
+        .timestamp_opt(unix_seconds?, /*nsecs*/ 0)
+        .single()
 }

@@ -170,9 +170,11 @@ async fn history_hydration_metadata_tracks_missing_turns_and_stale_completions_k
             /*limit*/ 2,
         )
         .await?;
+    let known_turn_ids = thread.turns.iter().map(|turn| turn.id.clone()).collect();
     let items = server
-        .apply_older_history_page(target.thread_id, &old_cursor, page, &mut thread.turns)
-        .await?;
+        .fetch_older_history_page(target.thread_id, &old_cursor, page, known_turn_ids)
+        .await?
+        .apply(&mut thread.turns);
     assert_eq!(
         items.iter().map(ThreadItem::id).collect::<Vec<_>>(),
         vec!["item-3-0", "item-5-0"]

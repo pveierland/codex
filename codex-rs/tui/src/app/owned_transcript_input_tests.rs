@@ -849,3 +849,135 @@ async fn modified_arrows_and_editor_chords_resume_composer_movement() -> Result<
     tui.set_owned_screen(/*owned*/ false)?;
     Ok(())
 }
+
+#[tokio::test]
+async fn wheel_bursts_scroll_without_painting_each_notch() -> Result<()> {
+    let mut app = crate::app::test_support::make_test_app().await;
+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    let size = tui.terminal.size()?;
+    app.transcript_cells = vec![Arc::new(PlainHistoryCell::new(
+        (0..200).map(|row| format!("row {row}").into()).collect(),
+    ))];
+    app.render_owned_transcript(&mut tui, size)?;
+    let latest = screen(&tui);
+
+    for _ in 0..40 {
+        app.handle_tui_event(
+            &mut tui,
+            &mut app_server,
+            pointer_event(MouseEventKind::ScrollUp, /*column*/ 1, /*row*/ 1),
+        )
+        .await?;
+    }
+    // Queued notches only move the viewport; the next frame paints their combined result.
+    assert_eq!(screen(&tui), latest);
+    app.render_owned_transcript(&mut tui, size)?;
+    let scrolled = screen(&tui);
+    // A fast flick accelerates, so 40 notches cover the whole 200-row transcript.
+    assert!(scrolled.contains("row 0"), "{scrolled}");
+    assert!(!scrolled.contains("row 199"), "{scrolled}");
+
+    // A reversing notch applies immediately to the pending position rather than waiting
+    // for the earlier notches to be painted.
+    app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        pointer_event(
+            MouseEventKind::ScrollDown,
+            /*column*/ 1,
+            /*row*/ 1,
+        ),
+    )
+    .await?;
+    assert_eq!(screen(&tui), scrolled);
+    app.render_owned_transcript(&mut tui, size)?;
+    assert_ne!(screen(&tui), scrolled);
+
+    app_server.shutdown().await?;
+    tui.set_owned_screen(/*owned*/ false)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reading_history_shows_the_time_of_the_top_entry() -> Result<()> {
+    let mut app = crate::app::test_support::make_test_app().await;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    let size = tui.terminal.size()?;
+    let rows = |name: &str| -> Arc<dyn HistoryCell> {
+        Arc::new(PlainHistoryCell::new(
+            (0..100).map(|row| format!("{name} {row}").into()).collect(),
+        ))
+    };
+    let (older, newer) = (rows("older"), rows("newer"));
+    app.history_times = Default::default();
+    let older_time =
+        super::history_times::local_time(/*unix_seconds*/ 1_791_000_000).expect("valid time");
+    let newer_time = older_time + chrono::Duration::hours(/*hours*/ 1);
+    app.history_times.record(&older, older_time);
+    app.history_times.record(&newer, newer_time);
+    app.transcript_cells = vec![older, newer];
+    let label =
+        |time: chrono::DateTime<chrono::Local>| time.format("%Y-%m-%dT%H:%M:%S%:z").to_string();
+    let top_line = |tui: &tui::Tui| screen(tui).lines().next().unwrap_or_default().to_string();
+
+    // Following the latest output shows no timestamp.
+    app.render_owned_transcript(&mut tui, size)?;
+    assert!(
+        !screen(&tui).contains(&label(newer_time)),
+        "{}",
+        screen(&tui)
+    );
+
+    app.transcript_view
+        .scroll(&app.transcript_cells, /*rows*/ -30);
+    app.render_owned_transcript(&mut tui, size)?;
+    let top = top_line(&tui);
+    assert!(top.starts_with("newer"), "{top}");
+    assert!(top.trim_end().ends_with(&label(newer_time)), "{top}");
+
+    app.transcript_view
+        .scroll(&app.transcript_cells, /*rows*/ -150);
+    app.render_owned_transcript(&mut tui, size)?;
+    let top = top_line(&tui);
+    assert!(top.starts_with("older"), "{top}");
+    assert!(top.trim_end().ends_with(&label(older_time)), "{top}");
+
+    tui.set_owned_screen(/*owned*/ false)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn editing_bursts_do_not_paint_each_keystroke_twice() -> Result<()> {
+    let mut app = crate::app::test_support::make_test_app().await;
+    let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_owned_screen(/*owned*/ true)?;
+    let size = tui.terminal.size()?;
+    app.transcript_cells = vec![Arc::new(PlainHistoryCell::new(vec!["transcript".into()]))];
+    app.chat_widget
+        .apply_external_edit("draft xyzzy".to_string());
+    app.render_owned_transcript(&mut tui, size)?;
+    assert!(screen(&tui).contains("draft xyzzy"), "{}", screen(&tui));
+
+    for _ in 0..3 {
+        app.handle_tui_event(
+            &mut tui,
+            &mut app_server,
+            TuiEvent::Key(KeyCode::Backspace.into()),
+        )
+        .await?;
+    }
+    assert_eq!(app.chat_widget.composer_text_with_pending(), "draft xy");
+    // Keystrokes update the draft; the next scheduled frame paints the whole burst once.
+    assert!(screen(&tui).contains("draft xyzzy"), "{}", screen(&tui));
+    app.render_owned_transcript(&mut tui, size)?;
+    assert!(screen(&tui).contains("draft xy"), "{}", screen(&tui));
+    assert!(!screen(&tui).contains("draft xyz"), "{}", screen(&tui));
+
+    app_server.shutdown().await?;
+    tui.set_owned_screen(/*owned*/ false)?;
+    Ok(())
+}

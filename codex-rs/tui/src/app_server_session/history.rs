@@ -1,5 +1,6 @@
 //! Bounded app-server transcript loading for resume, fork, and transcript views.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 use super::AppServerSession;
@@ -14,6 +15,7 @@ use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemEntry;
 use codex_app_server_protocol::ThreadItemsListCursor;
 use codex_app_server_protocol::ThreadItemsListParams;
 use codex_app_server_protocol::ThreadItemsListResponse;
@@ -202,25 +204,30 @@ impl AppServerSession {
         }
     }
 
-    pub(crate) async fn apply_older_history_page(
+    /// Fetch the turn metadata an older page needs, without touching the thread's turns.
+    ///
+    /// `known_turn_ids` lists the turns already loaded. Apply the result with
+    /// [`OlderHistoryPage::apply`]; keeping the two steps apart lets callers avoid holding the
+    /// thread's store across these requests.
+    pub(crate) async fn fetch_older_history_page(
         &mut self,
         thread_id: ThreadId,
         cursor: &str,
         page: ThreadItemsListResponse,
-        turns: &mut Vec<Turn>,
-    ) -> Result<Vec<ThreadItem>> {
+        mut known_turn_ids: HashSet<String>,
+    ) -> Result<OlderHistoryPage> {
         if !self.is_older_history_page_pending(thread_id, cursor) {
-            return Ok(Vec::new());
+            return Ok(OlderHistoryPage::default());
         }
         let Some(mut state) = self.history_pagination.get(&thread_id).cloned() else {
-            return Ok(Vec::new());
+            return Ok(OlderHistoryPage::default());
         };
-        let items = self
-            .merge_thread_item_page(thread_id, page, &mut state, turns)
+        let page = self
+            .fetch_page_turns(thread_id, page, &mut state, &mut known_turn_ids)
             .await?;
         state.loading_older = false;
         self.history_pagination.insert(thread_id, state);
-        Ok(items)
+        Ok(page)
     }
 
     pub(crate) async fn thread_items_page(
@@ -269,6 +276,24 @@ impl AppServerSession {
         state: &mut ThreadHistoryPagination,
         turns: &mut Vec<Turn>,
     ) -> Result<Vec<ThreadItem>> {
+        let mut known_turn_ids = turns
+            .iter()
+            .map(|turn| turn.id.clone())
+            .collect::<HashSet<_>>();
+        let page = self
+            .fetch_page_turns(thread_id, page, state, &mut known_turn_ids)
+            .await?;
+        Ok(page.apply(turns))
+    }
+
+    /// Advance the item cursor, fetch metadata for turns the page needs, and record item times.
+    async fn fetch_page_turns(
+        &mut self,
+        thread_id: ThreadId,
+        page: ThreadItemsListResponse,
+        state: &mut ThreadHistoryPagination,
+        known_turn_ids: &mut HashSet<String>,
+    ) -> Result<OlderHistoryPage> {
         state.next_item_cursor = advancing_cursor(
             state.next_item_cursor.as_deref(),
             page.next_cursor,
@@ -277,12 +302,13 @@ impl AppServerSession {
         let mut missing_turn_ids = page
             .data
             .iter()
-            .filter(|entry| !turns.iter().any(|turn| turn.id == entry.turn_id))
+            .filter(|entry| !known_turn_ids.contains(&entry.turn_id))
             .map(|entry| entry.turn_id.clone())
             .collect::<HashSet<_>>();
-        let mut items = Vec::new();
-        for entry in page.data {
-            while !turns.iter().any(|turn| turn.id == entry.turn_id) {
+        // Fetch metadata before touching `turns`, so a failed request leaves them unchanged.
+        let mut fetched_turns = Vec::new();
+        for entry in &page.data {
+            while !known_turn_ids.contains(&entry.turn_id) {
                 let Some(cursor) = state.next_turn_cursor.take() else {
                     break;
                 };
@@ -299,19 +325,29 @@ impl AppServerSession {
                 );
                 for turn in &page.data {
                     missing_turn_ids.remove(&turn.id);
+                    known_turn_ids.insert(turn.id.clone());
                 }
-                turns.splice(0..0, page.data.into_iter().rev());
-            }
-            if let Some(turn) = turns.iter_mut().find(|turn| turn.id == entry.turn_id)
-                && !turn.items.iter().any(|item| item.id() == entry.item.id())
-            {
-                items.push(entry.item.clone());
-                turn.items.insert(/*index*/ 0, entry.item);
-                turn.items_view = TurnItemsView::Summary;
+                fetched_turns.splice(0..0, page.data.into_iter().rev());
             }
         }
-        items.reverse();
-        Ok(items)
+        let times = self.history_item_times.entry(thread_id).or_default();
+        for entry in &page.data {
+            if let Some(time) = entry.started_at_ms.or(entry.created_at_ms) {
+                times.insert(entry.item.id().to_string(), time);
+            }
+        }
+        Ok(OlderHistoryPage {
+            turns: fetched_turns,
+            entries: page.data,
+        })
+    }
+
+    /// When a paged history item happened, in Unix milliseconds, if the server recorded it.
+    pub(crate) fn history_item_time(&self, thread_id: ThreadId, item_id: &str) -> Option<i64> {
+        self.history_item_times
+            .get(&thread_id)?
+            .get(item_id)
+            .copied()
     }
 
     /// Hydrates paginated threads through bounded turn and item pages.
@@ -339,6 +375,7 @@ impl AppServerSession {
             return Ok(());
         }
 
+        self.history_item_times.remove(&thread_id);
         let page = self
             .thread_turns_page(thread_id, turn_cursor, INITIAL_HISTORY_TURN_LIMIT)
             .await?;
@@ -436,6 +473,75 @@ fn rendered_history_rows(
         let height = usize::from(cell.desired_height_for_mode(width, mode));
         rows + height + usize::from(height != 0 && rows != 0 && !cell.is_stream_continuation())
     })
+}
+
+/// An older history page and the turn metadata it needs, ready to apply to the loaded turns.
+#[derive(Debug, Default)]
+pub(crate) struct OlderHistoryPage {
+    /// Turns the page needed that were not loaded, oldest first.
+    turns: Vec<Turn>,
+    /// The page's items, newest first.
+    entries: Vec<ThreadItemEntry>,
+}
+
+impl OlderHistoryPage {
+    /// Add the page to `turns` and return its new items, oldest first.
+    ///
+    /// Turns that appeared while the page was fetched are kept as they are.
+    pub(crate) fn apply(self, turns: &mut Vec<Turn>) -> Vec<ThreadItem> {
+        let known = turns
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<HashSet<_>>();
+        let fetched = self
+            .turns
+            .into_iter()
+            .filter(|turn| !known.contains(turn.id.as_str()))
+            .collect::<Vec<_>>();
+        turns.splice(0..0, fetched);
+        prepend_page_items(turns, self.entries)
+    }
+}
+
+/// Prepend a newest-first page of entries to their turns, skipping items a turn already has.
+///
+/// Returns the new items oldest first. Work is bounded by the page and the turns it touches, so
+/// paging through a long thread does not slow down as more of it is loaded.
+fn prepend_page_items(turns: &mut [Turn], entries: Vec<ThreadItemEntry>) -> Vec<ThreadItem> {
+    let mut added: HashMap<usize, Vec<ThreadItem>> = HashMap::new();
+    let mut items = Vec::new();
+    {
+        let turn_indices = turns
+            .iter()
+            .enumerate()
+            .map(|(index, turn)| (turn.id.as_str(), index))
+            .collect::<HashMap<_, _>>();
+        let mut known_items: HashMap<usize, HashSet<&str>> = HashMap::new();
+        let mut page_items = HashSet::new();
+        for entry in entries {
+            let Some(&index) = turn_indices.get(entry.turn_id.as_str()) else {
+                continue;
+            };
+            let known = known_items
+                .entry(index)
+                .or_insert_with(|| turns[index].items.iter().map(ThreadItem::id).collect());
+            if known.contains(entry.item.id())
+                || !page_items.insert((index, entry.item.id().to_string()))
+            {
+                continue;
+            }
+            items.push(entry.item.clone());
+            added.entry(index).or_default().push(entry.item);
+        }
+    }
+    for (index, mut new_items) in added {
+        new_items.reverse();
+        let turn = &mut turns[index];
+        turn.items.splice(0..0, new_items);
+        turn.items_view = TurnItemsView::Summary;
+    }
+    items.reverse();
+    items
 }
 
 #[cfg(test)]

@@ -1804,6 +1804,10 @@ pub struct ThreadItemEntry {
     /// Unix timestamp (milliseconds) when the item completed, if recorded by the producer.
     #[ts(type = "number | null")]
     pub completed_at_ms: Option<i64>,
+    /// Unix timestamp (milliseconds) when the item first appeared in the thread. Stored items
+    /// always have it, including those whose producer recorded no lifecycle times.
+    #[ts(type = "number | null")]
+    pub created_at_ms: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

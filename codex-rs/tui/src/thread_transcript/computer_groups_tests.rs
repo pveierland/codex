@@ -172,3 +172,33 @@ fn joins_respect_actual_turns_and_intervening_items() {
     };
     assert!(join_computer_groups(&older[0], &newer[0], &turns).is_none());
 }
+
+#[test]
+fn each_cell_reports_the_item_that_started_it() {
+    let message = |id: &str| ThreadItem::AgentMessage {
+        id: id.to_string(),
+        text: format!("message {id}"),
+        phase: None,
+        memory_citation: None,
+        delivery: None,
+        questions: None,
+    };
+    let items = vec![
+        message("first"),
+        computer("a"),
+        computer("b"),
+        message("between"),
+        computer("c"),
+    ];
+    let (cells, sources) = crate::thread_transcript::thread_items_to_transcript_cells_with_sources(
+        /*thread_id*/ None,
+        &AbsolutePathBuf::current_dir().unwrap(),
+        items.clone(),
+        RawReasoningVisibility::Hidden,
+        /*config*/ None,
+    );
+
+    assert_eq!(cells.len(), project(&items).len());
+    // The first group is flushed by the later message, but still dates from its first call.
+    assert_eq!(sources, vec![0, 1, 3, 4]);
+}

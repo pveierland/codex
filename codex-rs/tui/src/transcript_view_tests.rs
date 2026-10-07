@@ -1165,3 +1165,46 @@ fn history_prefetch_counts_rows_in_preceding_entries() {
         assert!(view.near_start(&cells));
     }
 }
+
+#[test]
+fn upward_scroll_past_loaded_history_continues_when_older_pages_arrive() {
+    for reversed in [false, true] {
+        let mut cells = vec![cell(
+            (0..10)
+                .map(|row| format!("current {row}\n"))
+                .collect::<String>(),
+        )];
+        let mut view = TranscriptView {
+            history: TranscriptHistoryState::Partial,
+            ..TranscriptView::default()
+        };
+        render(&mut view, &cells, /*width*/ 20, /*height*/ 3);
+        // Seven rows reach the oldest loaded row; five more wait for older history.
+        view.scroll(&cells, /*rows*/ -12);
+        if reversed {
+            // Reversing direction while the page loads abandons the remaining rows.
+            view.scroll(&cells, /*rows*/ 1);
+        }
+        let reading = text(&render(
+            &mut view, &cells, /*width*/ 20, /*height*/ 3,
+        ));
+        cells.insert(
+            /*index*/ 0,
+            cell(
+                (0..10)
+                    .map(|row| format!("older {row}\n"))
+                    .collect::<String>(),
+            ),
+        );
+        view.history = TranscriptHistoryState::Complete;
+        view.history_loaded(&cells, 0..1);
+        let top = text(&render(
+            &mut view, &cells, /*width*/ 20, /*height*/ 3,
+        ));
+        if reversed {
+            assert_eq!(top, reading);
+        } else {
+            assert_eq!(top.lines().next(), Some("older 6"), "{top}");
+        }
+    }
+}

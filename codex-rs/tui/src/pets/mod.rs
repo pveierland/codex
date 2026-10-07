@@ -144,6 +144,13 @@ pub(crate) struct PetImageRenderState {
     last_protocol: Option<image_protocol::ImageProtocol>,
 }
 
+impl PetImageRenderState {
+    /// Whether an image may still occupy terminal cells outside the text buffers.
+    pub(crate) fn is_displayed(&self) -> bool {
+        self.last_protocol.is_some() || self.last_sixel_clear_area.is_some()
+    }
+}
+
 fn render_pet_image(
     writer: &mut impl Write,
     state: &mut PetImageRenderState,

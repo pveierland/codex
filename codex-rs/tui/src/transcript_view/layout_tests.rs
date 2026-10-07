@@ -93,7 +93,8 @@ fn layouts_refresh_for_width_animation_and_mutable_frames() {
 
 #[test]
 fn recent_entries_are_reused_and_old_entries_are_evicted() {
-    let cells: Vec<_> = (0..100).map(|_| Arc::new(Cell::default())).collect();
+    let count = MAX_CACHED_ENTRIES + 36;
+    let cells: Vec<_> = (0..count).map(|_| Arc::new(Cell::default())).collect();
     let mut cache = LayoutCache::default();
     cache.begin_frame();
     for cell in &cells {
@@ -116,7 +117,7 @@ fn recent_entries_are_reused_and_old_entries_are_evicted() {
             },
         );
     }
-    for index in [99, 98, 0] {
+    for index in [count - 1, count - 2, 0] {
         let history = cells[index].clone() as Arc<dyn HistoryCell>;
         cache.get(
             &history,
@@ -137,7 +138,7 @@ fn recent_entries_are_reused_and_old_entries_are_evicted() {
         );
     }
     assert_eq!(
-        [99, 98, 0].map(|index| cells[index].renders.load(Ordering::Relaxed)),
+        [count - 1, count - 2, 0].map(|index| cells[index].renders.load(Ordering::Relaxed)),
         [1, 1, 2]
     );
 }

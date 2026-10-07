@@ -236,6 +236,23 @@ impl App {
                 );
                 footer_height_changed = false;
             }
+            if let Some(time) = view
+                .reading_top_entry(&self.transcript_cells, |cells, index| {
+                    self.history_times.time_at(cells, index)
+                })
+                .flatten()
+            {
+                super::history_times::render_reading_time(
+                    time,
+                    Rect::new(
+                        /*x*/ 0,
+                        /*y*/ 0,
+                        transcript_width,
+                        transcript_bottom,
+                    ),
+                    frame.buffer,
+                );
+            }
             blossom_tick = chat_widget
                 .empty_state_animation
                 .borrow_mut()
@@ -378,7 +395,14 @@ impl App {
         }
         if let TuiEvent::Mouse(mouse) = event {
             let composer_ready = self.chat_widget.prepare_composer_mouse(*mouse);
-            if mouse.kind != crossterm::event::MouseEventKind::Moved {
+            // Wheel input only needs the viewport bounds from the last frame. Painting before
+            // each notch would draw every queued notch and delay later input behind them.
+            if !matches!(
+                mouse.kind,
+                crossterm::event::MouseEventKind::Moved
+                    | crossterm::event::MouseEventKind::ScrollUp
+                    | crossterm::event::MouseEventKind::ScrollDown
+            ) {
                 let size = tui.prepare_draw_size()?;
                 self.render_owned_transcript(tui, size)?;
             }
@@ -422,7 +446,9 @@ impl App {
                 return Ok(false);
             }
         }
-        if matches!(event, TuiEvent::Key(key) if key.kind != KeyEventKind::Release) {
+        if matches!(event, TuiEvent::Key(key)
+            if key.kind != KeyEventKind::Release && self.transcript_key_needs_layout(*key))
+        {
             let size = tui.prepare_draw_size()?;
             self.render_owned_transcript(tui, size)?;
         }
@@ -603,6 +629,26 @@ impl App {
         Ok(true)
     }
 
+    /// Whether a key may act on transcript geometry, which must match the latest state first.
+    ///
+    /// Text editing reaches the composer unchanged, so refreshing the transcript before it would
+    /// only paint every keystroke twice and let a typing burst queue full frames.
+    fn transcript_key_needs_layout(&self, key: KeyEvent) -> bool {
+        let editing = matches!(
+            key.code,
+            KeyCode::Char(_)
+                | KeyCode::Backspace
+                | KeyCode::Delete
+                | KeyCode::Left
+                | KeyCode::Right
+        ) && matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT);
+        !editing
+            || self.transcript_view.has_active_interaction()
+            || self.transcript_view.owns_interaction_key(key)
+            || self.keymap.app.find_transcript.is_pressed(key)
+            || self.keymap.app.focus_activity.is_pressed(key)
+    }
+
     /// Keep the navigation hint and input guard aligned, including pending paste and attachments.
     fn enter_returns_to_latest(&self) -> bool {
         self.chat_widget.composer_is_empty()
@@ -658,3 +704,7 @@ mod warning_notice_tests;
 #[cfg(test)]
 #[path = "owned_transcript_follow_tests.rs"]
 mod follow_tests;
+
+#[cfg(test)]
+#[path = "input_latency_benchmark_tests.rs"]
+mod input_latency_benchmark_tests;

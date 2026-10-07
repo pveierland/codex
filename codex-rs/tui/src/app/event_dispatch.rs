@@ -61,6 +61,7 @@ impl App {
                     | AppEvent::ConfirmDaemonUpdate(_)
                     | AppEvent::RunDaemonUpdate(_)
                     | AppEvent::InsertHistoryCell(_)
+                    | AppEvent::HistoryReplayClock { .. }
                     | AppEvent::CommitRealtimeTranscriptHistory
                     | AppEvent::ResetTranscriptForThreadSwitch
                     | AppEvent::ResetTranscriptForThreadSwitchPreservingScreen
@@ -877,6 +878,15 @@ impl App {
             AppEvent::InsertHistoryCell(cell) => {
                 self.insert_history_cell(tui, cell);
             }
+            AppEvent::HistoryReplayClock { item_id, fallback } => {
+                let item_time = item_id.zip(self.chat_widget.thread_id()).and_then(
+                    |(item_id, thread_id)| app_server.history_item_time(thread_id, &item_id),
+                );
+                let clock = item_time
+                    .and_then(super::history_times::local_time_ms)
+                    .or(fallback);
+                self.history_times.set_replay_clock(clock);
+            }
             AppEvent::TurnTipReady { thread_id, turn_id } => {
                 self.turn_tips.ready(thread_id, &turn_id, self.transcript_cells.last());
                 tui.frame_requester().schedule_frame();
@@ -917,6 +927,7 @@ impl App {
                     Arc::new(history_cell::new_proposed_plan(source, &self.config.cwd));
 
                 if start < end {
+                    self.history_times.inherit(&self.transcript_cells[start], &consolidated);
                     self.native_history.consolidate(&self.transcript_cells[start..end], &consolidated);
                     if tui.is_owned_screen() {
                         self.transcript_view.replace_group(&self.transcript_cells, start..end, &consolidated);
@@ -935,6 +946,7 @@ impl App {
                 } else {
                     let deferred = tui.is_owned_screen() || self.native_history.insert(&consolidated);
                     self.transcript_cells.push(consolidated.clone());
+                    self.history_times.record_inserted(&consolidated);
                     if let Some(Overlay::Transcript(t)) = &mut self.overlay {
                         t.insert_cell(consolidated.clone());
                         tui.frame_requester().schedule_frame();

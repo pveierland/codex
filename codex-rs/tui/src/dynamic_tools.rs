@@ -908,6 +908,7 @@ async fn execute_inner(
                                                 item,
                                                 started_at_ms: None,
                                                 completed_at_ms: None,
+                                                created_at_ms: None,
                                             })
                                             .collect(),
                                     )

@@ -11576,6 +11576,13 @@ class ThreadItemEntry(BaseModel):
             description="Unix timestamp (milliseconds) when the item completed, if recorded by the producer.",
         ),
     ] = None
+    created_at_ms: Annotated[
+        int | None,
+        Field(
+            alias="createdAtMs",
+            description="Unix timestamp (milliseconds) when the item first appeared in the thread. Stored items always have it, including those whose producer recorded no lifecycle times.",
+        ),
+    ] = None
     item: ThreadItem
     started_at_ms: Annotated[
         int | None,

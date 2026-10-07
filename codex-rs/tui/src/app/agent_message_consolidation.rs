@@ -39,6 +39,7 @@ impl App {
             if !tui.is_owned_screen() {
                 self.native_history.defer(&cell);
             }
+            self.history_times.record_inserted(&cell);
             self.transcript_cells.push(cell);
         }
 
@@ -55,6 +56,8 @@ impl App {
                 "ConsolidateAgentMessage: replacing cells [{start}..{end}] with AgentMarkdownCell"
             );
             let consolidated: Arc<dyn HistoryCell> = Arc::new(source);
+            self.history_times
+                .inherit(&self.transcript_cells[start], &consolidated);
             self.native_history
                 .consolidate(&self.transcript_cells[start..end], &consolidated);
             if tui.is_owned_screen() {

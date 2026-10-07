@@ -270,10 +270,21 @@ impl TranscriptView {
                 } else {
                     1.0
                 };
+                let upward = event.kind == MouseEventKind::ScrollUp;
+                if !self.begin_wheel_notch(cells, upward) {
+                    return Some(ViewAction::Changed);
+                }
                 if self.pending_mouse_scroll.signum() != direction {
                     self.pending_mouse_scroll = 0.0;
                 }
-                self.pending_mouse_scroll += direction * self.mouse_scroll_speed;
+                // A fast flick grows each notch's step, up to half the viewport.
+                let max_rows = f64::from((self.area.height / 2).max(1));
+                let acceleration = self.wheel_flick.notch(
+                    upward,
+                    std::time::Instant::now(),
+                    max_rows / self.mouse_scroll_speed.max(f64::EPSILON),
+                );
+                self.pending_mouse_scroll += direction * self.mouse_scroll_speed * acceleration;
                 // Decimal speeds can land just short of a whole row after repeated addition.
                 let rounded = self.pending_mouse_scroll.round();
                 if rounded != 0.0 && (self.pending_mouse_scroll - rounded).abs() < 1e-9 {

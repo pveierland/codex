@@ -128,94 +128,174 @@ pub(crate) fn thread_items_to_transcript_cells(
     raw_reasoning_visibility: RawReasoningVisibility,
     config: Option<&Config>,
 ) -> TranscriptCells {
+    project_items(
+        thread_id,
+        cwd,
+        items,
+        raw_reasoning_visibility,
+        config,
+        /*sources*/ None,
+    )
+}
+
+/// Like [`thread_items_to_transcript_cells`], also returning for each cell the index of the item
+/// that started it, so callers can attribute per-item metadata such as times to grouped cells.
+pub(crate) fn thread_items_to_transcript_cells_with_sources(
+    thread_id: Option<ThreadId>,
+    cwd: &AbsolutePathBuf,
+    items: impl IntoIterator<Item = ThreadItem>,
+    raw_reasoning_visibility: RawReasoningVisibility,
+    config: Option<&Config>,
+) -> (TranscriptCells, Vec<usize>) {
+    let mut sources = Vec::new();
+    let cells = project_items(
+        thread_id,
+        cwd,
+        items,
+        raw_reasoning_visibility,
+        config,
+        Some(&mut sources),
+    );
+    (cells, sources)
+}
+
+fn project_items(
+    thread_id: Option<ThreadId>,
+    cwd: &AbsolutePathBuf,
+    items: impl IntoIterator<Item = ThreadItem>,
+    raw_reasoning_visibility: RawReasoningVisibility,
+    config: Option<&Config>,
+    mut sources: Option<&mut Vec<usize>>,
+) -> TranscriptCells {
     let inline_visualization_context = config.and_then(|config| {
         thread_id.and_then(|thread_id| InlineVisualizationContext::from_config(config, thread_id))
     });
     let mut cells: TranscriptCells = Vec::new();
     let mut pending = None;
-    for item in items {
-        if matches!(item, ThreadItem::Reasoning { .. })
-            && let Some(group) = &mut pending
-        {
-            for cell in item_to_cells(
+    // The item that started the pending group.
+    let mut pending_start = 0;
+    for (index, item) in items.into_iter().enumerate() {
+        let before = cells.len();
+        let had_pending = pending.is_some();
+        project_item(
+            item,
+            cwd,
+            raw_reasoning_visibility,
+            &inline_visualization_context,
+            &mut pending,
+            &mut cells,
+        );
+        // Every branch flushes a pending group before pushing anything else, so when cells were
+        // added the first one is the earlier group.
+        let flushed = had_pending && cells.len() > before;
+        if let Some(sources) = sources.as_deref_mut() {
+            for position in before..cells.len() {
+                sources.push(if flushed && position == before {
+                    pending_start
+                } else {
+                    index
+                });
+            }
+        }
+        if pending.is_some() && (!had_pending || flushed) {
+            pending_start = index;
+        }
+    }
+    let before = cells.len();
+    PendingActivity::flush(&mut pending, &mut cells);
+    if let Some(sources) = sources {
+        sources.extend((before..cells.len()).map(|_| pending_start));
+    }
+    cells
+}
+
+fn project_item(
+    item: ThreadItem,
+    cwd: &AbsolutePathBuf,
+    raw_reasoning_visibility: RawReasoningVisibility,
+    inline_visualization_context: &Option<InlineVisualizationContext>,
+    pending: &mut Option<PendingActivity>,
+    cells: &mut TranscriptCells,
+) {
+    if matches!(item, ThreadItem::Reasoning { .. })
+        && let Some(group) = pending
+    {
+        for cell in item_to_cells(
+            item,
+            cwd,
+            raw_reasoning_visibility,
+            inline_visualization_context.clone(),
+        ) {
+            match group {
+                PendingActivity::Computer(group) => group.group.push_detail(cell),
+                PendingActivity::Exploration(group) => group.group.push_detail(cell),
+            }
+        }
+        return;
+    }
+    if let Some(cell) = tools::historical_tool_fallback(&item) {
+        PendingActivity::flush(pending, cells);
+        cells.push(Arc::new(cell));
+        return;
+    }
+    match item {
+        item @ ThreadItem::McpToolCall { .. } => {
+            let Some(call) = tools::McpHistory::from_item(item) else {
+                PendingActivity::flush(pending, cells);
+                return;
+            };
+            if call.invocation.is_computer_activity() {
+                match pending {
+                    Some(PendingActivity::Computer(group)) => {
+                        computer_groups::append(group, call);
+                    }
+                    Some(PendingActivity::Exploration(_)) | None => {
+                        PendingActivity::flush(pending, cells);
+                        let mut group = crate::history_cell::ComputerActivityCell::default();
+                        computer_groups::append(&mut group, call);
+                        *pending = Some(PendingActivity::Computer(group));
+                    }
+                }
+            } else {
+                PendingActivity::flush(pending, cells);
+                let cell = call.into_cell();
+                cells.push(Arc::new(cell));
+            }
+        }
+        item @ ThreadItem::CommandExecution { .. } => {
+            if matches!(pending, Some(PendingActivity::Computer(_))) {
+                PendingActivity::flush(pending, cells);
+            }
+            if let Some(command) = tools::CommandHistory::from_item(item) {
+                let newer = command.into_cell();
+                if let Some(PendingActivity::Exploration(group)) = pending {
+                    if let Err(newer) = group.append_completed(newer) {
+                        PendingActivity::flush(pending, cells);
+                        *pending = Some(PendingActivity::Exploration(newer));
+                    }
+                } else {
+                    *pending = Some(PendingActivity::Exploration(newer));
+                }
+                if let Some(PendingActivity::Exploration(group)) = pending
+                    && group.should_flush()
+                {
+                    PendingActivity::flush(pending, cells);
+                }
+            }
+        }
+        item => {
+            let projected = item_to_cells(
                 item,
                 cwd,
                 raw_reasoning_visibility,
                 inline_visualization_context.clone(),
-            ) {
-                match group {
-                    PendingActivity::Computer(group) => group.group.push_detail(cell),
-                    PendingActivity::Exploration(group) => group.group.push_detail(cell),
-                }
-            }
-            continue;
-        }
-        if let Some(cell) = tools::historical_tool_fallback(&item) {
-            PendingActivity::flush(&mut pending, &mut cells);
-            cells.push(Arc::new(cell));
-            continue;
-        }
-        match item {
-            item @ ThreadItem::McpToolCall { .. } => {
-                let Some(call) = tools::McpHistory::from_item(item) else {
-                    PendingActivity::flush(&mut pending, &mut cells);
-                    continue;
-                };
-                if call.invocation.is_computer_activity() {
-                    match &mut pending {
-                        Some(PendingActivity::Computer(group)) => {
-                            computer_groups::append(group, call);
-                        }
-                        Some(PendingActivity::Exploration(_)) | None => {
-                            PendingActivity::flush(&mut pending, &mut cells);
-                            let mut group = crate::history_cell::ComputerActivityCell::default();
-                            computer_groups::append(&mut group, call);
-                            pending = Some(PendingActivity::Computer(group));
-                        }
-                    }
-                } else {
-                    PendingActivity::flush(&mut pending, &mut cells);
-                    let cell = call.into_cell();
-                    cells.push(Arc::new(cell));
-                }
-            }
-            item @ ThreadItem::CommandExecution { .. } => {
-                if matches!(pending, Some(PendingActivity::Computer(_))) {
-                    PendingActivity::flush(&mut pending, &mut cells);
-                }
-                if let Some(command) = tools::CommandHistory::from_item(item) {
-                    let newer = command.into_cell();
-                    if let Some(PendingActivity::Exploration(group)) = &mut pending {
-                        if let Err(newer) = group.append_completed(newer) {
-                            PendingActivity::flush(&mut pending, &mut cells);
-                            pending = Some(PendingActivity::Exploration(newer));
-                        }
-                    } else {
-                        pending = Some(PendingActivity::Exploration(newer));
-                    }
-                    if let Some(PendingActivity::Exploration(group)) = &pending
-                        && group.should_flush()
-                    {
-                        PendingActivity::flush(&mut pending, &mut cells);
-                    }
-                }
-            }
-            item => {
-                let projected = item_to_cells(
-                    item,
-                    cwd,
-                    raw_reasoning_visibility,
-                    inline_visualization_context.clone(),
-                );
-                if !projected.is_empty() {
-                    PendingActivity::flush(&mut pending, &mut cells);
-                    cells.extend(projected);
-                }
+            );
+            if !projected.is_empty() {
+                PendingActivity::flush(pending, cells);
+                cells.extend(projected);
             }
         }
     }
-    PendingActivity::flush(&mut pending, &mut cells);
-    cells
 }
 
 /// Project one item without changing the active widget or its turn lifecycle.

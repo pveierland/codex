@@ -2081,8 +2081,14 @@ async fn paginated_history_lists_and_legacy_reads_use_projected_turns_and_items(
         SortDirection::Asc,
     )
     .await?;
+    // Stored items are dated when projected, so only the presence of that time is stable.
+    let mut first_items = first_items_page.data;
+    for entry in &mut first_items {
+        assert!(entry.created_at_ms.is_some(), "{entry:?}");
+        entry.created_at_ms = None;
+    }
     assert_eq!(
-        first_items_page.data,
+        first_items,
         vec![ThreadItemEntry {
             turn_id: "turn-1".to_string(),
             item: ThreadItem::UserMessage {
@@ -2092,6 +2098,7 @@ async fn paginated_history_lists_and_legacy_reads_use_projected_turns_and_items(
             },
             started_at_ms: Some(0),
             completed_at_ms: Some(1),
+            created_at_ms: None,
         }]
     );
     let second_items_page = read_items_page(
