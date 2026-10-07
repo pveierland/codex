@@ -258,10 +258,33 @@ pub fn set_modes() -> Result<()> {
     keyboard_modes::enable_keyboard_enhancement(&mut stdout());
 
     #[cfg(not(windows))]
-    let _ = execute!(stdout(), EnableFocusChange);
+    let _ = execute!(stdout(), EnableFocusChange, EnableColorSchemeUpdates);
     #[cfg(windows)]
     let _ = execute!(stdout(), DisableFocusChange);
     Ok(())
+}
+
+/// Ask the terminal to report palette changes (DEC mode 2031) so the TUI can follow theme changes.
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnableColorSchemeUpdates;
+
+#[cfg(not(windows))]
+impl Command for EnableColorSchemeUpdates {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        write!(f, "\x1b[?2031h")
+    }
+}
+
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisableColorSchemeUpdates;
+
+#[cfg(not(windows))]
+impl Command for DisableColorSchemeUpdates {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        write!(f, "\x1b[?2031l")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +372,8 @@ fn restore_common(
         first_error.get_or_insert(err);
     }
     let _ = execute!(stdout(), DisableFocusChange);
+    #[cfg(not(windows))]
+    let _ = execute!(stdout(), DisableColorSchemeUpdates);
     if matches!(raw_mode_restore, RawModeRestore::Disable)
         && let Err(err) = disable_raw_mode()
     {
@@ -997,6 +1022,8 @@ impl Tui {
         }
 
         self.resume_events();
+        // The theme may have changed while the external program owned the terminal.
+        self.event_broker.refresh_default_colors();
         self.schedule_screen_size_recheck(Duration::ZERO);
         output
     }

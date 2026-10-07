@@ -139,7 +139,22 @@ pub fn default_bg() -> Option<(u8, u8, u8)> {
 pub(crate) fn set_default_colors_from_startup_probe(
     colors: Option<crate::terminal_probe::DefaultColors>,
 ) {
-    imp::set_default_colors_from_startup_probe(colors);
+    imp::set_default_colors(colors);
+}
+
+/// Adopt default colors the terminal reported after startup, as after a theme change.
+///
+/// Returns whether they differ from the cached colors, in which case the adaptive syntax theme
+/// follows the new background and rendered content must be repainted.
+#[cfg(any(unix, windows))]
+pub(crate) fn adopt_default_colors(colors: crate::terminal_probe::DefaultColors) -> bool {
+    let previous = default_colors();
+    if previous.is_some_and(|previous| previous.fg == colors.fg && previous.bg == colors.bg) {
+        return false;
+    }
+    imp::set_default_colors(Some(colors));
+    crate::render::highlight::follow_terminal_background(previous.map(|previous| previous.bg));
+    true
 }
 
 #[cfg(all(unix, not(test)))]
@@ -183,9 +198,7 @@ mod imp {
         cache.get_or_init_with(query_default_colors)
     }
 
-    pub(super) fn set_default_colors_from_startup_probe(
-        colors: Option<crate::terminal_probe::DefaultColors>,
-    ) {
+    pub(super) fn set_default_colors(colors: Option<crate::terminal_probe::DefaultColors>) {
         if let Ok(mut cache) = default_colors_cache().lock() {
             cache.value = colors.map(|colors| DefaultColors {
                 fg: colors.fg,
@@ -252,9 +265,7 @@ mod imp {
         cache.get_or_init_with(query_default_colors)
     }
 
-    pub(super) fn set_default_colors_from_startup_probe(
-        colors: Option<crate::terminal_probe::DefaultColors>,
-    ) {
+    pub(super) fn set_default_colors(colors: Option<crate::terminal_probe::DefaultColors>) {
         if let Ok(mut cache) = default_colors_cache().lock() {
             cache.value = colors.map(|colors| DefaultColors {
                 fg: colors.fg,
@@ -284,10 +295,7 @@ mod imp {
     }
 
     #[cfg(any(unix, windows))]
-    pub(super) fn set_default_colors_from_startup_probe(
-        _colors: Option<crate::terminal_probe::DefaultColors>,
-    ) {
-    }
+    pub(super) fn set_default_colors(_colors: Option<crate::terminal_probe::DefaultColors>) {}
 }
 
 /// The subset of Xterm colors that are usually consistent across terminals.

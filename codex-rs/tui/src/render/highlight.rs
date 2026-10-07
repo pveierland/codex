@@ -207,12 +207,42 @@ fn load_custom_theme(name: &str, codex_home: &Path) -> Option<Theme> {
 }
 
 fn adaptive_default_theme_selection() -> (EmbeddedThemeName, &'static str) {
-    match crate::terminal_palette::default_bg() {
+    adaptive_theme_for_background(crate::terminal_palette::default_bg())
+}
+
+fn adaptive_theme_for_background(
+    background: Option<(u8, u8, u8)>,
+) -> (EmbeddedThemeName, &'static str) {
+    match background {
         Some(bg) if crate::color::is_light(bg) => {
             (EmbeddedThemeName::CatppuccinLatte, "catppuccin-latte")
         }
         _ => (EmbeddedThemeName::CatppuccinMocha, "catppuccin-mocha"),
     }
+}
+
+/// Follow a terminal background change while the adaptive default theme is active.
+///
+/// `previous_background` is the background the active default was chosen for. A configured theme,
+/// or one picked since then, stays active.
+pub(crate) fn follow_terminal_background(previous_background: Option<(u8, u8, u8)>) {
+    let configured = THEME_OVERRIDE
+        .get()
+        .and_then(Option::as_deref)
+        .is_some_and(|name| {
+            let home = CODEX_HOME.get().and_then(|home| home.as_deref());
+            resolve_theme_by_name(name, home).is_some()
+        });
+    let (previous, _) = adaptive_theme_for_background(previous_background);
+    let (next, _) = adaptive_default_theme_selection();
+    if configured || previous == next {
+        return;
+    }
+    let themes = two_face::theme::extra();
+    if current_syntax_theme().name != themes.get(previous).name {
+        return;
+    }
+    set_syntax_theme(themes.get(next).clone());
 }
 
 fn adaptive_default_embedded_theme_name() -> EmbeddedThemeName {
@@ -785,6 +815,30 @@ mod tests {
     use syntect::highlighting::StyleModifier;
     use syntect::highlighting::ThemeItem;
     use syntect::highlighting::ThemeSettings;
+
+    #[test]
+    fn adaptive_default_theme_follows_terminal_background_changes() {
+        let themes = two_face::theme::extra();
+        let dark = (20, 20, 20);
+        let light = crate::terminal_probe::DefaultColors {
+            fg: (20, 20, 20),
+            bg: (250, 250, 250),
+        };
+        crate::terminal_palette::with_test_default_colors(light, || {
+            set_syntax_theme(themes.get(EmbeddedThemeName::CatppuccinMocha).clone());
+            follow_terminal_background(Some(dark));
+            assert_eq!(
+                current_syntax_theme().name,
+                themes.get(EmbeddedThemeName::CatppuccinLatte).name
+            );
+
+            // A theme the user picked is not the adaptive default and stays active.
+            let picked = themes.get(EmbeddedThemeName::Dracula).clone();
+            set_syntax_theme(picked.clone());
+            follow_terminal_background(Some(dark));
+            assert_eq!(current_syntax_theme().name, picked.name);
+        });
+    }
 
     #[test]
     fn active_theme_and_revision_are_isolated_between_test_threads() {
