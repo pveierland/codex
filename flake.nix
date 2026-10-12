@@ -37,6 +37,8 @@
         else "0.0.0-dev+${self.shortRev or "dirty"}";
     in
     {
+      homeModules.default = import ./nix/home-manager.nix { inherit self; };
+
       packages = forAllSystems (system:
         let
           pkgs = import nixpkgs {
